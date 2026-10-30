@@ -1,12 +1,16 @@
 //! The notification-area icon and its balloons.
+//!
+//! The tooltip and the artwork are recorded as shown only once the shell has
+//! accepted them, so a change Explorer missed (it was hung, for example) is
+//! sent again the next time the status is shown (at least once a minute).
 
 use windows::core::w;
 use windows::Win32::Foundation::{ERROR_SUCCESS, HWND};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_WARNING,
-    NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICONDATAW_0, NOTIFYICON_VERSION_4,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_WARNING, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICONDATAW_0, NOTIFY_ICON_MESSAGE, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::SM_CXSMICON;
 
@@ -34,14 +38,25 @@ struct IconKey {
     size: u32,
 }
 
+/// Sends one `Shell_NotifyIconW` message; true if the shell accepted it.
+type Notify = fn(NOTIFY_ICON_MESSAGE, &NOTIFYICONDATAW) -> bool;
+
+fn shell_notify(message: NOTIFY_ICON_MESSAGE, data: &NOTIFYICONDATAW) -> bool {
+    // SAFETY: `data` is a fully initialized NOTIFYICONDATAW for our window.
+    unsafe { Shell_NotifyIconW(message, data) }.as_bool()
+}
+
 /// The tray icon of the main window.
 pub(crate) struct Tray {
     hwnd: HWND,
     added: bool,
     active: bool,
+    /// The tooltip the shell shows (while added), or will get when added.
     tip: String,
+    /// The artwork the shell shows (while added); `None` when it must be sent again.
     key: Option<IconKey>,
     icon: Option<Icon>,
+    notify: Notify,
 }
 
 /// True when the taskbar uses the dark theme
@@ -81,7 +96,11 @@ fn small_icon_size() -> u32 {
 impl Tray {
     /// A tray icon for `hwnd`, not yet added (call [`Tray::ensure_added`]).
     pub(crate) fn new(hwnd: HWND) -> Tray {
-        Tray { hwnd, added: false, active: false, tip: DEFAULT_TOOLTIP.to_owned(), key: None, icon: None }
+        Tray::with_notify(hwnd, shell_notify)
+    }
+
+    fn with_notify(hwnd: HWND, notify: Notify) -> Tray {
+        Tray { hwnd, added: false, active: false, tip: DEFAULT_TOOLTIP.to_owned(), key: None, icon: None, notify }
     }
 
     fn data(&self) -> NOTIFYICONDATAW {
@@ -121,8 +140,8 @@ impl Tray {
         data.uCallbackMessage = WM_APP_TRAY;
         data.hIcon = self.icon.as_ref().map(Icon::handle).unwrap_or_default();
         data.szTip = fixed_wide(&self.tip);
-        // SAFETY: `data` is a fully initialized NOTIFYICONDATAW for our window.
-        let notify = |message| unsafe { Shell_NotifyIconW(message, &data) }.as_bool();
+        let send = self.notify;
+        let notify = |message| send(message, &data);
         // An icon that is already there (for example after a NIM_ADD that timed
         // out but did succeed) refuses NIM_ADD and accepts NIM_MODIFY.
         let (first, second) = if self.added { (NIM_MODIFY, NIM_ADD) } else { (NIM_ADD, NIM_MODIFY) };
@@ -133,8 +152,7 @@ impl Tray {
             return false;
         }
         data.Anonymous = NOTIFYICONDATAW_0 { uVersion: NOTIFYICON_VERSION_4 };
-        // SAFETY: as above.
-        if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) }.as_bool() {
+        if !(self.notify)(NIM_SETVERSION, &data) {
             crate::log_warn!("NIM_SETVERSION 4 was refused");
         }
         self.added = true;
@@ -149,45 +167,52 @@ impl Tray {
 
     /// Re-reads the theme and DPI and swaps the icon if needed.
     pub(crate) fn refresh(&mut self) {
-        if self.update_icon() && self.added {
-            self.modify_icon();
+        if self.update_icon() && self.added && !self.modify_icon() {
+            // Not shown: build and send it again next time.
+            self.key = None;
         }
     }
 
-    /// Switches between the active and the paused (dimmed) artwork.
+    /// Switches between the active and the paused (dimmed) artwork, and
+    /// sends the artwork again if the shell missed it last time.
     pub(crate) fn set_active(&mut self, active: bool) {
-        if self.active != active {
+        if self.active != active || self.key.is_none() {
             self.active = active;
             self.refresh();
         }
     }
 
-    /// Sets the tooltip (at most 127 characters; longer text is cut with an ellipsis).
+    /// Sets the tooltip (at most 127 characters; longer text is cut with an
+    /// ellipsis). If the shell refuses it, the same text is sent again on the next call.
     pub(crate) fn set_tip(&mut self, tip: &str) {
         if self.tip == tip {
             return;
         }
-        self.tip = tip.to_owned();
         if !self.added {
+            // Sent by `ensure_added`.
+            self.tip = tip.to_owned();
             return;
         }
         let mut data = self.data();
         data.uFlags = NIF_TIP | NIF_SHOWTIP;
-        data.szTip = fixed_wide(&self.tip);
-        // SAFETY: fully initialized data for our icon.
-        if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
-            crate::log_warn!("could not update the tray tooltip");
+        data.szTip = fixed_wide(tip);
+        if (self.notify)(NIM_MODIFY, &data) {
+            self.tip = tip.to_owned();
+        } else {
+            crate::log_warn!("could not update the tray tooltip (will retry)");
         }
     }
 
-    fn modify_icon(&self) {
+    /// Sends the current artwork; true if the shell accepted it.
+    fn modify_icon(&self) -> bool {
         let mut data = self.data();
         data.uFlags = NIF_ICON;
         data.hIcon = self.icon.as_ref().map(Icon::handle).unwrap_or_default();
-        // SAFETY: fully initialized data for our icon.
-        if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
-            crate::log_warn!("could not update the tray icon");
+        let accepted = (self.notify)(NIM_MODIFY, &data);
+        if !accepted {
+            crate::log_warn!("could not update the tray icon (will retry)");
         }
+        accepted
     }
 
     /// Shows a balloon (a toast on Windows 10 and 11) from the tray icon.
@@ -203,8 +228,7 @@ impl Tray {
         data.dwInfoFlags = match kind {
             Balloon::Warning => NIIF_WARNING,
         };
-        // SAFETY: fully initialized data for our icon.
-        if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {
+        if !(self.notify)(NIM_MODIFY, &data) {
             crate::log_warn!("could not show a balloon");
         }
     }
@@ -213,10 +237,8 @@ impl Tray {
     pub(crate) fn remove(&mut self) {
         if self.added {
             let data = self.data();
-            // SAFETY: identifies our icon by window and id.
-            unsafe {
-                let _ = Shell_NotifyIconW(NIM_DELETE, &data);
-            }
+            // Identifies our icon by window and id.
+            let _ = (self.notify)(NIM_DELETE, &data);
             self.added = false;
         }
     }
@@ -225,5 +247,113 @@ impl Tray {
 impl Drop for Tray {
     fn drop(&mut self) {
         self.remove();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+
+    use crate::util::from_wide;
+
+    /// One message the fake shell got: the message, its flags and its tooltip.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Sent {
+        message: NOTIFY_ICON_MESSAGE,
+        flags: u32,
+        tip: String,
+    }
+
+    thread_local! {
+        static SENT: RefCell<Vec<Sent>> = const { RefCell::new(Vec::new()) };
+        /// The next message the fake shell refuses (like a send that timed out on a hung Explorer).
+        static REFUSE_NEXT: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn fake_shell(message: NOTIFY_ICON_MESSAGE, data: &NOTIFYICONDATAW) -> bool {
+        let tip = from_wide(&data.szTip);
+        SENT.with(|sent| sent.borrow_mut().push(Sent { message, flags: data.uFlags.0, tip }));
+        !REFUSE_NEXT.with(|refuse| refuse.replace(false))
+    }
+
+    /// What the fake shell got since the last call.
+    fn sent() -> Vec<Sent> {
+        SENT.with(|sent| std::mem::take(&mut *sent.borrow_mut()))
+    }
+
+    fn refuse_next() {
+        REFUSE_NEXT.with(|refuse| refuse.set(true));
+    }
+
+    /// A tray icon on this test's thread, which needs COM for the artwork
+    /// (WIC), as the UI thread has.
+    fn tray() -> Tray {
+        // SAFETY: initializes COM for this test thread, which ends with the test.
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        Tray::with_notify(HWND::default(), fake_shell)
+    }
+
+    /// A tray icon already in the notification area.
+    fn added_tray() -> Tray {
+        let mut tray = tray();
+        assert!(tray.ensure_added());
+        let added = sent();
+        assert_eq!(added.first().map(|sent| sent.message), Some(NIM_ADD), "{added:?}");
+        tray
+    }
+
+    #[test]
+    fn a_refused_tooltip_is_sent_again() {
+        let mut tray = added_tray();
+        refuse_next();
+        tray.set_tip("MelCat: Mel is playing");
+        assert_eq!(sent().len(), 1);
+        // The next status update (at least once a minute) sends it again.
+        tray.set_tip("MelCat: Mel is playing");
+        let again = sent();
+        assert_eq!(
+            again,
+            [Sent {
+                message: NIM_MODIFY,
+                flags: (NIF_TIP | NIF_SHOWTIP).0,
+                tip: "MelCat: Mel is playing".to_owned()
+            }]
+        );
+        // Accepted now: nothing more to send.
+        tray.set_tip("MelCat: Mel is playing");
+        assert_eq!(sent(), []);
+    }
+
+    #[test]
+    fn a_refused_icon_is_sent_again() {
+        let mut tray = added_tray();
+        refuse_next();
+        tray.set_active(true);
+        let first = sent();
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!((first[0].message, first[0].flags), (NIM_MODIFY, NIF_ICON.0));
+        // Same state, but the shell never showed it: sent again.
+        tray.set_active(true);
+        let again = sent();
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert_eq!((again[0].message, again[0].flags), (NIM_MODIFY, NIF_ICON.0));
+        // Accepted now: nothing more to send.
+        tray.set_active(true);
+        assert_eq!(sent(), []);
+    }
+
+    #[test]
+    fn changes_before_the_icon_is_added_wait_for_it() {
+        let mut tray = tray();
+        tray.set_tip("MelCat: Mel is napping");
+        tray.set_active(true);
+        assert_eq!(sent(), []);
+        assert!(tray.ensure_added());
+        let added = sent();
+        let first = added.first().map(|sent| (sent.message, sent.tip.as_str()));
+        assert_eq!(first, Some((NIM_ADD, "MelCat: Mel is napping")), "{added:?}");
     }
 }

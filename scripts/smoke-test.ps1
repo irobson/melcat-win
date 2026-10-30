@@ -94,6 +94,40 @@
                     'Access is denied (error 5). The change applies until
                     MelCat quits.', not 'Access is denied. (os error 5). ...'.
                     MelCat keeps running.
+      settings-preview-label
+                    The settings window's Preview row is the macOS one: a
+                    Static 'Try the movement now' left of the Preview button
+                    (control 135), on its row, with the note (control 136)
+                    under the label.
+      settings-repaint
+                    After a larger text size (the message font 1.5 times as
+                    tall, set for the session only with SPI_SETNONCLIENTMETRICS
+                    and put back afterwards, then the WM_SETTINGCHANGE Windows
+                    sends for it; the window must grow), every label of the
+                    settings window on the screen shows exactly the pixels a
+                    full repaint (RedrawWindow with RDW_ALLCHILDREN |
+                    RDW_UPDATENOW) gives: none keeps pixels drawn in the old
+                    font. The window is made topmost first. (WM_DPICHANGED
+                    takes the same path, but Windows refuses to send it from
+                    another process. A guard: on this Windows the window's own
+                    resize already repaints every control.)
+      settings-short-time
+                    With the long time format 'h:mm:ss tt', the short one
+                    'HH:mm tt' and the markers 'a.m.'/'p.m.' (SetLocaleInfoW,
+                    put back afterwards), twelve Down presses on the To
+                    picker's hour (posted to it after WM_NEXTDLGCTL) make the
+                    schedule end at 06:00 (settings.json end_minutes 360), and
+                    the hint reads exactly 'Ends the next morning at 06:00
+                    a.m.': the pickers' short format, one final period.
+                    (On this Windows a null format with TIME_NOSECONDS already
+                    gives the short format; the time part guards it.)
+                    SetLocaleInfoW changes the user's saved formats: if the
+                    script is killed during this step on a machine of yours,
+                    put the time formats back in Settings > Time & language.
+
+    settings-preview-label, settings-repaint and settings-short-time each
+    start MelCat without settings.json (a first launch, so the settings window
+    opens), with the pointer parked away from it.
 
     Each step from 'stroll' on starts its own MelCat: it asks any MelCat still
     running to quit (WM_CLOSE to MelCat.Main; the step fails unless it quits
@@ -2164,6 +2198,506 @@ namespace MelCatSmoke.AppSettings
             Assert (-not $script:Mel.HasExited) 'MelCat exited after failing to save'
         } finally {
             Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # =======================================================================
+    # settings-preview-label, settings-repaint, settings-short-time: the
+    # settings window's page, each on a first launch of its own.
+
+    $uiSettingsHelpers = @'
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace MelCatSmoke.UiSettings
+{
+    /// A direct child window: its control ID, class, text and screen rectangle.
+    public class Child
+    {
+        public IntPtr Hwnd;
+        public int Id;
+        public string Class;
+        public string Text;
+        public int Left, Top, Right, Bottom;
+        public bool Visible;
+        public override string ToString()
+        {
+            return Id + " " + Class + " '" + Text + "' " + Left + "," + Top + "," + Right + "," + Bottom;
+        }
+    }
+
+    public static class Win
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT { public int X; public int Y; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct GUITHREADINFO
+        {
+            public uint cbSize; public uint flags; public IntPtr hwndActive; public IntPtr hwndFocus; public IntPtr hwndCapture;
+            public IntPtr hwndMenuOwner; public IntPtr hwndMoveSize; public IntPtr hwndCaret; public RECT rcCaret;
+        }
+        public delegate bool EnumProc(IntPtr hwnd, IntPtr lparam);
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc proc, IntPtr lparam);
+        [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumProc proc, IntPtr lparam);
+        [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr hwnd, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder name, int max);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool IsWindow(IntPtr hwnd);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr parent, int id);
+        [DllImport("user32.dll")] static extern int GetDlgCtrlID(IntPtr hwnd);
+        [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW", CharSet = CharSet.Unicode)]
+        static extern IntPtr SendText(IntPtr hwnd, uint msg, IntPtr wparam, StringBuilder lparam, uint flags, uint timeout, out IntPtr result);
+        [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW")]
+        static extern IntPtr SendPlain(IntPtr hwnd, uint msg, IntPtr wparam, IntPtr lparam, uint flags, uint timeout, out IntPtr result);
+        [DllImport("user32.dll", SetLastError = true)] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wparam, IntPtr lparam);
+        [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread, ref GUITHREADINFO info);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
+        [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] static extern bool RedrawWindow(IntPtr hwnd, IntPtr rect, IntPtr region, uint flags);
+        [DllImport("kernel32.dll", EntryPoint = "GetLocaleInfoW", CharSet = CharSet.Unicode)]
+        static extern int GetLocaleInfo(uint locale, uint type, StringBuilder data, int size);
+        [DllImport("kernel32.dll", EntryPoint = "SetLocaleInfoW", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool SetLocaleInfo(uint locale, uint type, string data);
+
+        const uint SMTO_ABORTIFHUNG = 0x0002;
+        const uint LOCALE_USER_DEFAULT = 0x0400;
+
+        static string ClassOf(IntPtr hwnd)
+        {
+            StringBuilder name = new StringBuilder(256);
+            GetClassName(hwnd, name, name.Capacity);
+            return name.ToString();
+        }
+
+        /// The first visible top-level window of class `cls` that belongs to process `pid`, or zero.
+        public static IntPtr FindVisibleOwned(string cls, int pid)
+        {
+            IntPtr result = IntPtr.Zero;
+            EnumWindows(delegate(IntPtr hwnd, IntPtr unused)
+            {
+                uint owner;
+                GetWindowThreadProcessId(hwnd, out owner);
+                if (owner == (uint)pid && IsWindowVisible(hwnd) && ClassOf(hwnd) == cls) { result = hwnd; return false; }
+                return true;
+            }, IntPtr.Zero);
+            return result;
+        }
+
+        public static bool Exists(IntPtr hwnd) { return IsWindow(hwnd); }
+
+        /// Posts WM_CLOSE; "" or the error.
+        public static string Close(IntPtr hwnd)
+        {
+            if (PostMessage(hwnd, 0x0010, IntPtr.Zero, IntPtr.Zero)) return "";
+            return "PostMessage error " + Marshal.GetLastWin32Error();
+        }
+
+        /// The window's text (WM_GETTEXT, which the system carries across processes).
+        public static string Text(IntPtr hwnd)
+        {
+            StringBuilder text = new StringBuilder(1024);
+            IntPtr result;
+            if (SendText(hwnd, 0x000D, (IntPtr)text.Capacity, text, SMTO_ABORTIFHUNG, 3000, out result) == IntPtr.Zero) return "(no answer)";
+            return text.ToString();
+        }
+
+        public static IntPtr Item(IntPtr parent, int id) { return GetDlgItem(parent, id); }
+
+        public static int[] Rect(IntPtr hwnd)
+        {
+            RECT r;
+            GetWindowRect(hwnd, out r);
+            return new int[] { r.Left, r.Top, r.Right, r.Bottom };
+        }
+
+        /// The direct children of `parent`, in z-order (the order they were created).
+        public static Child[] Children(IntPtr parent)
+        {
+            List<Child> all = new List<Child>();
+            EnumChildWindows(parent, delegate(IntPtr hwnd, IntPtr unused)
+            {
+                if (GetAncestor(hwnd, 1 /* GA_PARENT */) != parent) return true;
+                RECT r;
+                GetWindowRect(hwnd, out r);
+                Child c = new Child();
+                c.Hwnd = hwnd; c.Id = GetDlgCtrlID(hwnd); c.Class = ClassOf(hwnd); c.Text = Text(hwnd);
+                c.Left = r.Left; c.Top = r.Top; c.Right = r.Right; c.Bottom = r.Bottom; c.Visible = IsWindowVisible(hwnd);
+                all.Add(c);
+                return true;
+            }, IntPtr.Zero);
+            return all.ToArray();
+        }
+
+        /// The window with the keyboard focus on `hwnd`'s thread.
+        public static IntPtr FocusOf(IntPtr hwnd)
+        {
+            uint pid;
+            uint thread = GetWindowThreadProcessId(hwnd, out pid);
+            GUITHREADINFO info = new GUITHREADINFO();
+            info.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+            if (!GetGUIThreadInfo(thread, ref info)) return IntPtr.Zero;
+            return info.hwndFocus;
+        }
+
+        public static IntPtr Foreground() { return GetForegroundWindow(); }
+
+        /// WM_NEXTDLGCTL: the dialog moves the focus to `control`.
+        public static bool FocusControl(IntPtr dialog, IntPtr control)
+        {
+            IntPtr result;
+            return SendPlain(dialog, 0x0028, control, (IntPtr)1, SMTO_ABORTIFHUNG, 3000, out result) != IntPtr.Zero;
+        }
+
+        /// Posts `count` presses (WM_KEYDOWN, WM_KEYUP) of an extended key to `control`.
+        public static string PostKeys(IntPtr control, int vk, int scan, int count)
+        {
+            long down = 1L | ((long)scan << 16) | (1L << 24);
+            long up = down | (1L << 30) | (1L << 31);
+            for (int i = 0; i < count; i++)
+            {
+                if (!PostMessage(control, 0x0100, (IntPtr)vk, new IntPtr(down))) return "PostMessage error " + Marshal.GetLastWin32Error();
+                if (!PostMessage(control, 0x0101, (IntPtr)vk, new IntPtr(up))) return "PostMessage error " + Marshal.GetLastWin32Error();
+            }
+            return "";
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct LOGFONT
+        {
+            public int lfHeight; public int lfWidth; public int lfEscapement; public int lfOrientation; public int lfWeight;
+            public byte lfItalic; public byte lfUnderline; public byte lfStrikeOut; public byte lfCharSet;
+            public byte lfOutPrecision; public byte lfClipPrecision; public byte lfQuality; public byte lfPitchAndFamily;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string lfFaceName;
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct NONCLIENTMETRICS
+        {
+            public int cbSize; public int iBorderWidth; public int iScrollWidth; public int iScrollHeight; public int iCaptionWidth; public int iCaptionHeight;
+            public LOGFONT lfCaptionFont; public int iSmCaptionWidth; public int iSmCaptionHeight; public LOGFONT lfSmCaptionFont;
+            public int iMenuWidth; public int iMenuHeight; public LOGFONT lfMenuFont; public LOGFONT lfStatusFont; public LOGFONT lfMessageFont;
+            public int iPaddedBorderWidth;
+        }
+        [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool SystemParametersInfoMetrics(uint action, uint param, ref NONCLIENTMETRICS metrics, uint winIni);
+
+        static NONCLIENTMETRICS savedMetrics;
+        static bool haveSaved;
+
+        static string Metrics(out NONCLIENTMETRICS metrics)
+        {
+            metrics = new NONCLIENTMETRICS();
+            metrics.cbSize = Marshal.SizeOf(typeof(NONCLIENTMETRICS));
+            if (SystemParametersInfoMetrics(0x0029 /* SPI_GETNONCLIENTMETRICS */, (uint)metrics.cbSize, ref metrics, 0)) return "";
+            return "SPI_GETNONCLIENTMETRICS error " + Marshal.GetLastWin32Error();
+        }
+
+        static string SetMetrics(NONCLIENTMETRICS metrics)
+        {
+            // Not saved to the profile and not broadcast: only this session's value changes.
+            if (SystemParametersInfoMetrics(0x002A /* SPI_SETNONCLIENTMETRICS */, (uint)metrics.cbSize, ref metrics, 0)) return "";
+            return "SPI_SETNONCLIENTMETRICS error " + Marshal.GetLastWin32Error();
+        }
+
+        /// The message font: "face height".
+        public static string MessageFont()
+        {
+            NONCLIENTMETRICS m;
+            string err = Metrics(out m);
+            return err != "" ? err : m.lfMessageFont.lfFaceName + " " + m.lfMessageFont.lfHeight;
+        }
+
+        /// Makes the message font `factor` times as tall (the first call saves the original); "" or the error.
+        public static string ScaleMessageFont(double factor)
+        {
+            NONCLIENTMETRICS m;
+            string err = Metrics(out m);
+            if (err != "") return err;
+            if (!haveSaved) { savedMetrics = m; haveSaved = true; }
+            m.lfMessageFont.lfHeight = (int)Math.Round(m.lfMessageFont.lfHeight * factor);
+            return SetMetrics(m);
+        }
+
+        /// Puts back the message font ScaleMessageFont saved; "" or the error.
+        public static string RestoreMessageFont()
+        {
+            if (!haveSaved) return "";
+            string err = SetMetrics(savedMetrics);
+            if (err == "") haveSaved = false;
+            return err;
+        }
+
+        /// Sends WM_SETTINGCHANGE for SPI_SETNONCLIENTMETRICS, as Windows does
+        /// when the text size changes; "" or the error.
+        public static string SendMetricsChanged(IntPtr hwnd)
+        {
+            IntPtr result;
+            if (SendPlain(hwnd, 0x001A, (IntPtr)0x002A, IntPtr.Zero, SMTO_ABORTIFHUNG, 5000, out result) != IntPtr.Zero) return "";
+            return "SendMessageTimeout error " + Marshal.GetLastWin32Error();
+        }
+
+        /// Repaints the window and every control in it, now.
+        public static bool RepaintAll(IntPtr hwnd)
+        {
+            // RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW
+            return RedrawWindow(hwnd, IntPtr.Zero, IntPtr.Zero, 0x0001 | 0x0004 | 0x0080 | 0x0100);
+        }
+
+        /// Puts the window on top of every other one, topmost, without activating it.
+        public static bool Raise(IntPtr hwnd)
+        {
+            // HWND_TOPMOST; SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+            return SetWindowPos(hwnd, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010);
+        }
+
+        /// The process that owns the window at screen point (x, y).
+        public static int OwnerAt(int x, int y)
+        {
+            POINT p = new POINT();
+            p.X = x;
+            p.Y = y;
+            uint pid;
+            GetWindowThreadProcessId(WindowFromPoint(p), out pid);
+            return (int)pid;
+        }
+
+        public static string GetLocale(uint type)
+        {
+            StringBuilder data = new StringBuilder(100);
+            if (GetLocaleInfo(LOCALE_USER_DEFAULT, type, data, data.Capacity) <= 0) return null;
+            return data.ToString();
+        }
+
+        /// Sets one of the user's locale values; "" or the error.
+        public static string SetLocale(uint type, string value)
+        {
+            if (SetLocaleInfo(LOCALE_USER_DEFAULT, type, value)) return "";
+            return "SetLocaleInfo(0x" + type.ToString("X") + ", '" + value + "') error " + Marshal.GetLastWin32Error();
+        }
+
+        /// The screen rectangle (l, t, r, b), as a bitmap.
+        public static Bitmap Capture(int[] rect)
+        {
+            int width = Math.Max(1, rect[2] - rect[0]), height = Math.Max(1, rect[3] - rect[1]);
+            Bitmap bitmap = new Bitmap(width, height, PixelFormat.Format32bppArgb);
+            using (Graphics g = Graphics.FromImage(bitmap)) g.CopyFromScreen(rect[0], rect[1], 0, 0, bitmap.Size);
+            return bitmap;
+        }
+
+        static int[] Pixels(Bitmap bitmap)
+        {
+            Rectangle all = new Rectangle(0, 0, bitmap.Width, bitmap.Height);
+            BitmapData data = bitmap.LockBits(all, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+            int[] pixels = new int[bitmap.Width * bitmap.Height];
+            for (int y = 0; y < bitmap.Height; y++) Marshal.Copy(IntPtr.Add(data.Scan0, y * data.Stride), pixels, y * bitmap.Width, bitmap.Width);
+            bitmap.UnlockBits(data);
+            return pixels;
+        }
+
+        public static int Compared;
+        public static int DifferentPixels;
+        public static string Detail = "";
+
+        /// Compares two captures of screen rectangle `area` inside the rectangles
+        /// of `children` (screen coordinates). Sets Compared (children compared),
+        /// DifferentPixels and Detail (each child that differs, with its count).
+        public static void Compare(Bitmap before, Bitmap after, int[] area, Child[] children)
+        {
+            int[] a = Pixels(before), b = Pixels(after);
+            int width = before.Width;
+            Compared = 0;
+            DifferentPixels = 0;
+            StringBuilder detail = new StringBuilder();
+            foreach (Child c in children)
+            {
+                int left = Math.Max(c.Left, area[0]), top = Math.Max(c.Top, area[1]);
+                int right = Math.Min(c.Right, area[2]), bottom = Math.Min(c.Bottom, area[3]);
+                if (right <= left || bottom <= top) continue;
+                Compared++;
+                int differ = 0;
+                for (int y = top; y < bottom; y++)
+                {
+                    for (int x = left; x < right; x++)
+                    {
+                        int i = (y - area[1]) * width + (x - area[0]);
+                        if (a[i] != b[i]) differ++;
+                    }
+                }
+                if (differ > 0)
+                {
+                    DifferentPixels += differ;
+                    if (detail.Length > 0) detail.Append("; ");
+                    detail.Append(c.Id + " '" + c.Text + "': " + differ + " px");
+                }
+            }
+            Detail = detail.ToString();
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $uiSettingsHelpers -ReferencedAssemblies System.Drawing -Language CSharp
+
+    # Starts MelCat without settings.json, so it opens its settings window
+    # (with the default settings: On Schedule, Mon-Fri 9:00-18:00), and
+    # returns that window once it has painted. The pointer is parked away
+    # from the window first, so nothing in it is hovered.
+    function Open-SettingsWindow {
+        Close-MelCat
+        Set-Pointer ($script:Primary.Left + 150) ($script:Primary.Top + 40)
+        foreach ($path in @($SettingsPath, "$SettingsPath.tmp")) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+        Assert (-not (Test-Path -LiteralPath $SettingsPath)) "could not remove $SettingsPath"
+        $script:Mel = Start-MelCat
+        $hwnd = [IntPtr]::Zero
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+        do {
+            $hwnd = [MelCatSmoke.UiSettings.Win]::FindVisibleOwned('MelCat.Settings', $script:Mel.Id)
+            if ($hwnd -ne [IntPtr]::Zero) { break }
+            Start-Sleep -Milliseconds 100
+        } while ($watch.ElapsedMilliseconds -lt 10000)
+        Assert ($hwnd -ne [IntPtr]::Zero) "no visible MelCat.Settings window of MelCat (pid $($script:Mel.Id)) within 10 s"
+        Start-Sleep -Milliseconds 700  # let it paint
+        Note ("settings window 0x{0:X} of MelCat (pid {1}) at {2}" -f $hwnd.ToInt64(), $script:Mel.Id, ([MelCatSmoke.UiSettings.Win]::Rect($hwnd) -join ','))
+        return $hwnd
+    }
+
+    # Closes the settings window (WM_CLOSE) and waits until it is gone.
+    function Close-SettingsWindow([IntPtr]$Hwnd) {
+        $err = [MelCatSmoke.UiSettings.Win]::Close($Hwnd)
+        Assert ($err -eq '') "could not post WM_CLOSE to the settings window: $err"
+        Assert (Wait-Until { -not [MelCatSmoke.UiSettings.Win]::Exists($Hwnd) } 5000) 'the settings window was still there 5 s after WM_CLOSE'
+    }
+
+    Invoke-Step 'settings-preview-label' {
+        $hwnd = Open-SettingsWindow
+        $children = @([MelCatSmoke.UiSettings.Win]::Children($hwnd))
+        $label = @($children | Where-Object { $_.Class -eq 'Static' -and $_.Text -eq 'Try the movement now' })
+        $preview = @($children | Where-Object { $_.Id -eq 135 })
+        $note = @($children | Where-Object { $_.Id -eq 136 })
+        Assert ($label.Count -eq 1) "no Static reads 'Try the movement now' (as on macOS); the controls: $(($children | ForEach-Object { $_.ToString() }) -join '; ')"
+        Assert (($preview.Count -eq 1) -and ($preview[0].Text -eq 'Preview')) "control 135 is not the Preview button: $($preview -join '; ')"
+        Assert ($note.Count -eq 1) 'control 136 (the note) is missing'
+        $l = $label[0]; $b = $preview[0]; $n = $note[0]
+        Note "label: $l; button: $b; note: $n"
+        Assert ($l.Visible -and ($l.Right -gt $l.Left)) "the label is not shown: $l"
+        Assert (($l.Right -le $b.Left) -and ($l.Top -eq $b.Top) -and ($l.Bottom -eq $b.Bottom)) "the label is not on the Preview button's row, left of it"
+        Assert (($n.Top -ge $l.Bottom) -and ($n.Left -eq $l.Left)) "the note '$($n.Text)' is not under the label"
+        $shot = [MelCatSmoke.UiSettings.Win]::Capture([MelCatSmoke.UiSettings.Win]::Rect($hwnd))
+        $shot.Save((Join-Path $ArtifactsDir 'settings-preview-label.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+        $shot.Dispose()
+        Note 'screenshot: settings-preview-label.png'
+        Close-SettingsWindow $hwnd
+    }
+
+    Invoke-Step 'settings-repaint' {
+        $hwnd = Open-SettingsWindow
+        try {
+            Assert ([MelCatSmoke.UiSettings.Win]::Raise($hwnd)) 'could not put the settings window on top'
+            Start-Sleep -Milliseconds 300
+            $before = [MelCatSmoke.UiSettings.Win]::Rect($hwnd)
+            # A larger text size: the message font half as tall again, and the
+            # WM_SETTINGCHANGE Windows sends for it.
+            $font = [MelCatSmoke.UiSettings.Win]::MessageFont()
+            $err = [MelCatSmoke.UiSettings.Win]::ScaleMessageFont(1.5)
+            Assert ($err -eq '') $err
+            Note "message font: $font, now $([MelCatSmoke.UiSettings.Win]::MessageFont())"
+            $err = [MelCatSmoke.UiSettings.Win]::SendMetricsChanged($hwnd)
+            Assert ($err -eq '') "WM_SETTINGCHANGE (SPI_SETNONCLIENTMETRICS) was not answered: $err"
+            Start-Sleep -Milliseconds 700
+            $after = [MelCatSmoke.UiSettings.Win]::Rect($hwnd)
+            $grew = ($after[2] - $after[0]) / [double]($before[2] - $before[0])
+            Note ('the window went from {0} to {1} ({2:N2} times as wide)' -f ($before -join ','), ($after -join ','), $grew)
+            Assert ($grew -gt 1.1) 'the window was not laid out again for the larger font'
+
+            # The part of the window on the screen, and the labels in it.
+            $p = $script:Primary
+            $area = [int[]]@([Math]::Max($after[0], $p.Left), [Math]::Max($after[1], $p.Top), [Math]::Min($after[2], $p.Right), [Math]::Min($after[3], $p.Bottom))
+            $statics = @([MelCatSmoke.UiSettings.Win]::Children($hwnd) | Where-Object { $_.Class -eq 'Static' -and $_.Visible -and $_.Text -ne '' })
+            $covered = @($statics | Where-Object {
+                $x = [int][Math]::Floor(($_.Left + $_.Right) / 2); $y = [int][Math]::Floor(($_.Top + $_.Bottom) / 2)
+                ($x -ge $area[0]) -and ($x -lt $area[2]) -and ($y -ge $area[1]) -and ($y -lt $area[3]) -and ([MelCatSmoke.UiSettings.Win]::OwnerAt($x, $y) -ne $script:Mel.Id)
+            })
+            Assert ($covered.Count -eq 0) "another window covers labels of the settings window: $($covered -join '; ')"
+
+            # What the window shows now, against what it shows once every control repainted.
+            $shown = [MelCatSmoke.UiSettings.Win]::Capture($area)
+            Assert ([MelCatSmoke.UiSettings.Win]::RepaintAll($hwnd)) 'RedrawWindow failed'
+            Start-Sleep -Milliseconds 500
+            $repainted = [MelCatSmoke.UiSettings.Win]::Capture($area)
+            $shown.Save((Join-Path $ArtifactsDir 'settings-repaint-1-after-font-change.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+            $repainted.Save((Join-Path $ArtifactsDir 'settings-repaint-2-repainted.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+            [MelCatSmoke.UiSettings.Win]::Compare($shown, $repainted, $area, $statics)
+            $compared = [MelCatSmoke.UiSettings.Win]::Compared
+            $differ = [MelCatSmoke.UiSettings.Win]::DifferentPixels
+            Note ('{0} labels on screen compared (screenshots settings-repaint-*.png): {1} pixels differ after a full repaint{2}' -f $compared, $differ, $(if ($differ -gt 0) { ': ' + [MelCatSmoke.UiSettings.Win]::Detail } else { '' }))
+            $shown.Dispose(); $repainted.Dispose()
+            Assert ($compared -ge 5) "only $compared labels of the settings window are on the screen"
+            Assert ($differ -eq 0) "labels still showed pixels drawn in the old font: $([MelCatSmoke.UiSettings.Win]::Detail)"
+            Close-SettingsWindow $hwnd
+        } finally {
+            $err = [MelCatSmoke.UiSettings.Win]::RestoreMessageFont()
+            if ($err) { Write-Host "    (could not restore the message font: $err)" }
+        }
+    }
+
+    Invoke-Step 'settings-short-time' {
+        # The long time format (LOCALE_STIMEFORMAT), the short one
+        # (LOCALE_SSHORTTIME) and the AM and PM markers (LOCALE_S1159,
+        # LOCALE_S2359): set for this step, put back afterwards.
+        $types = @(0x1003, 0x79, 0x28, 0x29)
+        $values = @('h:mm:ss tt', 'HH:mm tt', 'a.m.', 'p.m.')
+        $saved = New-Object 'string[]' 4
+        for ($i = 0; $i -lt 4; $i++) { $saved[$i] = [MelCatSmoke.UiSettings.Win]::GetLocale([uint32]$types[$i]) }
+        Note ("the user's time formats: long '{0}', short '{1}', AM '{2}', PM '{3}'" -f $saved[0], $saved[1], $saved[2], $saved[3])
+        try {
+            for ($i = 0; $i -lt 4; $i++) {
+                $err = [MelCatSmoke.UiSettings.Win]::SetLocale([uint32]$types[$i], $values[$i])
+                Assert ($err -eq '') $err
+            }
+            $now = New-Object 'string[]' 4
+            for ($i = 0; $i -lt 4; $i++) { $now[$i] = [MelCatSmoke.UiSettings.Win]::GetLocale([uint32]$types[$i]) }
+            Note ("set for this step: long '{0}', short '{1}', AM '{2}', PM '{3}'" -f $now[0], $now[1], $now[2], $now[3])
+            Assert ($now[1] -eq 'HH:mm tt') "the short time format reads back as '$($now[1])'"
+            Start-Sleep -Milliseconds 300
+
+            $hwnd = Open-SettingsWindow
+            $to = [MelCatSmoke.UiSettings.Win]::Item($hwnd, 123)
+            $hint = [MelCatSmoke.UiSettings.Win]::Item($hwnd, 124)
+            Assert (($to -ne [IntPtr]::Zero) -and ($hint -ne [IntPtr]::Zero)) 'the To picker (123) or the hint (124) is missing'
+            Note ("To picker reads '{0}', hint '{1}'" -f [MelCatSmoke.UiSettings.Win]::Text($to), [MelCatSmoke.UiSettings.Win]::Text($hint))
+
+            # 18:00 to 06:00: twelve presses of Down on the picker's hour.
+            Assert ([MelCatSmoke.UiSettings.Win]::FocusControl($hwnd, $to)) 'WM_NEXTDLGCTL was not answered'
+            Note ('focus 0x{0:X} (the To picker is 0x{1:X}); foreground 0x{2:X}' -f [MelCatSmoke.UiSettings.Win]::FocusOf($hwnd).ToInt64(), $to.ToInt64(), [MelCatSmoke.UiSettings.Win]::Foreground().ToInt64())
+            $err = [MelCatSmoke.UiSettings.Win]::PostKeys($to, 0x28, 0x50, 12)
+            Assert ($err -eq '') "could not post the key presses: $err"
+            $script:EndMinutes = $null
+            $ended = Wait-Until {
+                try { $script:EndMinutes = ([System.IO.File]::ReadAllText($SettingsPath) | ConvertFrom-Json).end_minutes } catch { $script:EndMinutes = $null }
+                $script:EndMinutes -eq 360
+            } 5000
+            $text = [MelCatSmoke.UiSettings.Win]::Text($hint)
+            Note ("after twelve Down presses: To picker reads '{0}', settings.json end_minutes {1}, hint '{2}'" -f [MelCatSmoke.UiSettings.Win]::Text($to), $script:EndMinutes, $text)
+            Assert $ended 'the schedule did not end at 06:00 after twelve Down presses on the To picker'
+            Assert (-not $text.EndsWith('..')) "the hint ends in two periods: '$text'"
+            $expected = 'Ends the next morning at 06:00 a.m.'
+            Assert ($text -eq $expected) "the hint reads '$text', not '$expected' (the short time format HH:mm tt, as the pickers show it)"
+            Close-SettingsWindow $hwnd
+        } finally {
+            Close-MelCat
+            for ($i = 0; $i -lt 4; $i++) {
+                if ($null -ne $saved[$i]) {
+                    $err = [MelCatSmoke.UiSettings.Win]::SetLocale([uint32]$types[$i], $saved[$i])
+                    if ($err) { Write-Host "    (could not restore a time format: $err)" }
+                }
+            }
         }
     }
 } catch {
