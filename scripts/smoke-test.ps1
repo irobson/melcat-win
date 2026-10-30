@@ -942,7 +942,7 @@ namespace MelCatSmoke.Stroll
         Assert ($kinds -match '^started stopped started finished') "expected a stroll stopped by the takeover, then a whole stroll: $kinds"
 
         $delay = ($events[1].Time - $sentAt).TotalMilliseconds
-        Note ('takeover move from {0} to {1},{2} sent {3} ms into the stroll''s visible motion; MelCat logged the stop {4:N0} ms later' -f $from, $target[0], $target[1], $waited + 60, $delay)
+        Note ('takeover move from {0} to {1},{2} sent 60 ms after the stroll''s first visible move ({3} ms after parking); MelCat logged the stop {4:N0} ms later' -f $from, $target[0], $target[1], $waited, $delay)
         Assert ($delay -le 100) ('MelCat logged the stop {0:N0} ms after the takeover move, not within a frame or two' -f $delay)
 
         $after = @($changes | Where-Object { $_.Ms -ge $sentMs })
@@ -956,7 +956,7 @@ namespace MelCatSmoke.Stroll
         $rest = @($after | Select-Object -Skip ($land + 1))
         $stillMs = if ($rest.Count -gt 0) { $rest[0].Ms - $landed.Ms } else { [MelCatSmoke.Stroll.Sampler]::Now() - $landed.Ms }
         $nextMove = if ($rest.Count -gt 0) { $rest[0] } else { 'none' }
-        Note ('landed at {0} ({1} ms after sending; MelCat moves in between: {2}); stayed exactly there {3} ms, next move {4}' -f $landed, $landed.Ms - $sentMs, $early, $stillMs, $nextMove)
+        Note ('landed at {0} ({1} ms after sending; MelCat moves in between: {2}); stayed exactly there {3} ms, next move {4}' -f $landed, ($landed.Ms - $sentMs), $early, $stillMs, $nextMove)
         Assert ($stillMs -ge 1500) "the pointer left the takeover spot after $stillMs ms, for $nextMove"
 
         Assert (($events[2].FromX -eq $target[0]) -and ($events[2].FromY -eq $target[1])) "the next stroll did not start from the takeover spot: $($events[2].Detail)"
@@ -1069,7 +1069,7 @@ namespace MelCatSmoke.Input
             Note "${kind}: log: $(Format-StrollEvents $events)"
             Assert ($null -ne $stop) "the stroll neither stopped nor finished within 3 s of the $kind"
             $delay = if ($events.Count -ge 2) { ($events[1].Time - $sentAt).TotalMilliseconds } else { [double]::NaN }
-            Note ('{0}: {1} at {2}, {3} ms into the stroll''s visible motion; logged {4:N0} ms later: ''{5}''; moves 0.2 to 1.5 s later: {6}' -f $kind, $what, $at, $waited + 60, $delay, (Get-LogText $stop), $moves.Count)
+            Note ('{0}: {1} at {2}, 60 ms after the stroll''s first visible move; logged {3:N0} ms later: ''{4}''; moves 0.2 to 1.5 s later: {5}' -f $kind, $what, $at, $delay, (Get-LogText $stop), $moves.Count)
             Assert ($stop -match 'stroll stopped: input$') "the $kind did not stop the stroll: '$(Get-LogText $stop)'"
             Assert ((Get-StrollKinds $events) -eq 'started stopped') "expected one stroll, stopped by the ${kind}: $(Get-StrollKinds $events)"
             Assert ($moves.Count -eq 0) "MelCat moved the pointer after the $kind stopped the stroll: $($moves -join ' ')"
@@ -1123,6 +1123,11 @@ namespace MelCatSmoke.Kill
         public static extern uint SendInput(uint count, [In, MarshalAs(UnmanagedType.LPArray)] INPUT[] inputs, int size);
         [DllImport("user32.dll")] public static extern int GetSystemMetrics(int index);
         [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int key);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT { public int X; public int Y; }
+        [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT point);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hwnd, System.Text.StringBuilder name, int max);
+        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
     }
 
     public static class Clicker
@@ -1187,8 +1192,9 @@ namespace MelCatSmoke.Kill
         {
             Text = "MelCat smoke test";
             StartPosition = FormStartPosition.Manual;
-            FormBorderStyle = FormBorderStyle.FixedToolWindow;
-            ShowInTaskbar = false;
+            FormBorderStyle = FormBorderStyle.FixedSingle;
+            MaximizeBox = false;
+            MinimizeBox = false;
             TopMost = true;
             Bounds = bounds;
             Counter = new Button();
@@ -1248,6 +1254,48 @@ namespace MelCatSmoke.Kill
             }));
         }
 
+        /// True when the window at (x, y) is the test button.
+        public static bool ButtonAt(int x, int y)
+        {
+            Native.POINT p = new Native.POINT();
+            p.X = x;
+            p.Y = y;
+            IntPtr at = Native.WindowFromPoint(p);
+            IntPtr button = (IntPtr)Form.Invoke(new Func<IntPtr>(delegate { return Form.Counter.Handle; }));
+            return at == button;
+        }
+
+        /// The window at (x, y) and the test window's state, for evidence.
+        public static string Describe(int x, int y)
+        {
+            Native.POINT p = new Native.POINT();
+            p.X = x;
+            p.Y = y;
+            IntPtr at = Native.WindowFromPoint(p);
+            System.Text.StringBuilder name = new System.Text.StringBuilder(256);
+            Native.GetClassName(at, name, name.Capacity);
+            uint pid;
+            Native.GetWindowThreadProcessId(at, out pid);
+            string form = (string)Form.Invoke(new Func<string>(delegate
+            {
+                return "form 0x" + Form.Handle.ToString("X") + " visible=" + Form.Visible + " topmost=" + Form.TopMost
+                    + " bounds=" + Form.Bounds + " button 0x" + Form.Counter.Handle.ToString("X");
+            }));
+            return "window at " + x + "," + y + ": 0x" + at.ToString("X") + " " + name + " (pid " + pid + "); " + form;
+        }
+
+        /// Puts the test window on top again.
+        public static void Raise()
+        {
+            Form.Invoke(new Action(delegate
+            {
+                Form.TopMost = false;
+                Form.TopMost = true;
+                Form.BringToFront();
+                Form.Activate();
+            }));
+        }
+
         public static void Close()
         {
             try { if (Form != null) Form.Invoke(new Action(delegate { Form.Close(); })); } catch (Exception) { }
@@ -1273,7 +1321,7 @@ namespace MelCatSmoke.Kill
         Assert ($script:Mel.WaitForExit(5000)) "MelCat (pid $melPid) still ran 5 s after Stop-Process -Force"
         $events = @(Get-StrollEvents $mark)
         Note "log: $(Format-StrollEvents $events)"
-        Note ('killed MelCat (pid {0}, exit code 0x{1:X8}) with the pointer at {2}, {3} ms into the stroll''s visible motion' -f $melPid, $script:Mel.ExitCode, $at, $waited + 60)
+        Note ('killed MelCat (pid {0}, exit code 0x{1:X8}) with the pointer at {2}, 60 ms after the stroll''s first visible move' -f $melPid, $script:Mel.ExitCode, $at)
         Assert (($events.Count -ge 1) -and ($events[$events.Count - 1].Kind -eq 'started')) "MelCat was not in the middle of a stroll when it was killed: $(Get-StrollKinds $events)"
 
         # Nothing moves the pointer any more.
@@ -1298,6 +1346,12 @@ namespace MelCatSmoke.Kill
         # One click on the test button counts once.
         $cx = [int][Math]::Floor(($button[0] + $button[2]) / 2)
         $cy = [int][Math]::Floor(($button[1] + $button[3]) / 2)
+        if (-not [MelCatSmoke.Kill.Ui]::ButtonAt($cx, $cy)) {
+            Note "the test button is covered: $([MelCatSmoke.Kill.Ui]::Describe($cx, $cy)); raising it"
+            [MelCatSmoke.Kill.Ui]::Raise()
+            Start-Sleep -Milliseconds 300
+        }
+        Assert ([MelCatSmoke.Kill.Ui]::ButtonAt($cx, $cy)) "the test button is not under $cx,${cy}: $([MelCatSmoke.Kill.Ui]::Describe($cx, $cy))"
         $before = [MelCatSmoke.Kill.Ui]::Clicks
         if (-not [MelCatSmoke.Kill.Clicker]::Click($cx, $cy, 40)) { throw "SendInput failed for the click: $([MelCatSmoke.Kill.Clicker]::LastError)" }
         [void](Wait-Until { [MelCatSmoke.Kill.Ui]::Clicks -ge $before + 1 } 3000)
