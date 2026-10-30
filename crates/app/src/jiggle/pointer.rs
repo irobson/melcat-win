@@ -11,8 +11,11 @@
 //!   layout, negative origins included. Injected input goes into the session
 //!   input stream like hardware input, so it resets the idle time that
 //!   `GetLastInputInfo` reports: that is what keeps the computer awake.
-//!   UIPI silently drops injected input aimed at an elevated window; for a
-//!   pointer move that is harmless (the pointer still moves) and is documented.
+//!   UIPI silently drops injected input aimed at a window of higher
+//!   integrity than MelCat (an elevated window, such as Task Manager): the
+//!   pointer then does not move, and `SendInput` still reports success. The
+//!   jiggler notices that the pointer never left the stroll's start pixel and
+//!   stops (`the pointer could not be moved`).
 //! - [`seconds_since_last_input`] is `GetTickCount() - LASTINPUTINFO.dwTime`
 //!   (wrapping arithmetic) in seconds: any input in the session, MelCat's own
 //!   moves included.

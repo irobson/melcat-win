@@ -22,6 +22,10 @@
                     Gentle radius of the parking spot (5 pt, +1 px for
                     rounding); more strolls follow while idle, 2.5 to 5 s
                     apart, 4 in all, without drifting from the spot.
+                    MelCat's own moves reset the session's idle time: the
+                    script sends no input after parking, yet GetLastInputInfo
+                    (read every 10 ms) shows input during every stroll, and
+                    the idle time never exceeds the interval plus 2.5 s.
       edges         With Playful (12 pt), parked 2 px from the top-left corner
                     and then exactly at (0,0): over several strolls no sampled
                     position comes closer than 2 px to a screen edge once it
@@ -35,7 +39,12 @@
       input         A key press and release (F13) injected during one stroll
                     and a wheel notch during another each stop the stroll
                     ('stroll stopped: input'), and the pointer is let go.
-      off           With mode Off, no stroll starts and the pointer stays put
+      key-release   A lone F13 release (KEYEVENTF_KEYUP, no press before it)
+                    injected during a stroll does not stop it: the stroll
+                    ends with 'stroll finished at'. As on macOS, only key
+                    presses, modifier changes, button presses and the wheel
+                    are a person.
+      off          With mode Off, no stroll starts and the pointer stays put
                     over 12 s of idleness, and the log says 'status: off'.
       kill-mid-stroll
                     MelCat killed (Stop-Process -Force) during a stroll leaves
@@ -43,10 +52,19 @@
                     lands exactly where sent, no mouse button or modifier is
                     held, and one click on a WinForms test button hosted by the
                     script counts once.
+      held-button   The left button pressed where the pointer is (over a
+                    WinForms test button hosted by the script, without
+                    moving it) and held 100 ms during a stroll is a hand on
+                    the mouse, as on macOS: 'stroll stopped: pointer moved',
+                    and the pointer is let go.
       first-launch  Without settings.json MelCat opens its settings window (a
                     visible top-level MelCat.Settings window of its process; a
-                    screenshot is saved); WM_CLOSE closes it, settings.json
-                    then exists, and MelCat keeps running until asked to quit.
+                    screenshot is saved). A click on Preview gives it the
+                    focus and plays a preview; then Enter, held 100 ms, plays
+                    another, which ends with 'stroll finished at' (the
+                    release of Enter is not input). WM_CLOSE closes the
+                    window, settings.json then exists, and MelCat keeps
+                    running until asked to quit.
 
     Each step from 'stroll' on starts its own MelCat: it asks any MelCat still
     running to quit (WM_CLOSE to MelCat.Main), writes
@@ -804,10 +822,93 @@ namespace MelCatSmoke.Stroll
         return @($max, $at)
     }
 
+    # The session's idle time while MelCat strolls (used by the 'stroll' step).
+    $jiggleIdleHelpers = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+namespace MelCatSmoke.JiggleIdle
+{
+    /// Reads GetLastInputInfo about every 10 ms on its own thread: the
+    /// largest idle time seen, and when each input the session counted came.
+    public static class IdleWatch
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+        [DllImport("user32.dll")] static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
+        [DllImport("kernel32.dll")] static extern uint GetTickCount();
+
+        static readonly object Gate = new object();
+        static readonly List<DateTime> inputs = new List<DateTime>();
+        static Thread thread;
+        static volatile bool running;
+        public static long LargestIdleMs;
+        public static int Reads;
+
+        public static void Start()
+        {
+            Stop();
+            lock (Gate) inputs.Clear();
+            LargestIdleMs = 0;
+            Reads = 0;
+            running = true;
+            thread = new Thread(Run);
+            thread.IsBackground = true;
+            thread.Priority = ThreadPriority.AboveNormal;
+            thread.Start();
+        }
+
+        static void Run()
+        {
+            bool first = true;
+            uint last = 0;
+            while (running)
+            {
+                LASTINPUTINFO info = new LASTINPUTINFO();
+                info.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+                if (GetLastInputInfo(ref info))
+                {
+                    long idle = (long)unchecked(GetTickCount() - info.dwTime);
+                    DateTime now = DateTime.Now;
+                    Reads++;
+                    if (idle > LargestIdleMs) LargestIdleMs = idle;
+                    if (first || info.dwTime != last)
+                    {
+                        lock (Gate) inputs.Add(now.AddMilliseconds(-idle));
+                        last = info.dwTime;
+                        first = false;
+                    }
+                }
+                Thread.Sleep(10);
+            }
+        }
+
+        public static void Stop()
+        {
+            running = false;
+            if (thread != null)
+            {
+                thread.Join(2000);
+                thread = null;
+            }
+        }
+
+        /// When the session counted input, oldest first; the first is the
+        /// last input before Start.
+        public static DateTime[] Inputs() { lock (Gate) return inputs.ToArray(); }
+    }
+}
+'@
+    Add-Type -TypeDefinition $jiggleIdleHelpers -Language CSharp
+
     Invoke-Step 'stroll' {
         $park = Get-ScreenCenter
         $limit = $script:GentlePx + 1
         $mark = Restart-MelCat -Intensity 'Gentle' -Park $park
+        # (idle) From here on the script sends no input.
+        [MelCatSmoke.JiggleIdle.IdleWatch]::Start()
         $moved = Wait-Until { [MelCatSmoke.Stroll.Sampler]::Changes().Length -gt 1 } 15000
         $changes = [MelCatSmoke.Stroll.Sampler]::Changes()
         Assert $moved 'the pointer did not move by itself within 15 s of being parked'
@@ -817,6 +918,7 @@ namespace MelCatSmoke.Stroll
 
         $finished = @(Wait-LogCount 'stroll finished at ' $mark 4 45000)
         [MelCatSmoke.Stroll.Sampler]::Stop()
+        [MelCatSmoke.JiggleIdle.IdleWatch]::Stop()
         $changes = [MelCatSmoke.Stroll.Sampler]::Changes()
         $events = @(Get-StrollEvents $mark)
         Note "log: $(Format-StrollEvents $events)"
@@ -846,6 +948,26 @@ namespace MelCatSmoke.Stroll
         foreach ($gap in $gaps) {
             Assert (($gap -ge 2.5) -and ($gap -le 5.5)) ('a pause between two strolls lasted {0:N2} s, outside 2.5 to 5.5 s' -f $gap)
         }
+
+        # (idle) MelCat's own moves count as input for the session, which is
+        # what keeps the computer awake: the script sent nothing after
+        # parking, yet input shows up during every stroll, and the idle time
+        # never grows past the interval plus the slow first and last steps.
+        $inputs = @([MelCatSmoke.JiggleIdle.IdleWatch]::Inputs())
+        $largestIdle = [MelCatSmoke.JiggleIdle.IdleWatch]::LargestIdleMs
+        $idleLimit = ($script:IdleSeconds + 2.5) * 1000
+        $strollEnds = @($events | Where-Object { $_.Kind -eq 'finished' })
+        $inputsPerStroll = @()
+        for ($i = 0; $i -lt 4; $i++) {
+            $from = $starts[$i].Time.AddMilliseconds(-50)
+            $to = $strollEnds[$i].Time.AddMilliseconds(50)
+            $inputsPerStroll += @($inputs | Where-Object { ($_ -ge $from) -and ($_ -le $to) }).Count
+        }
+        Note ('session idle time (GetLastInputInfo, {0} reads): largest {1:N2} s, allowed {2:N1} s; inputs the session counted during each stroll: {3}' -f [MelCatSmoke.JiggleIdle.IdleWatch]::Reads, ($largestIdle / 1000.0), ($idleLimit / 1000.0), ($inputsPerStroll -join ', '))
+        for ($i = 0; $i -lt 4; $i++) {
+            Assert ($inputsPerStroll[$i] -ge 1) "the session counted no input during stroll $($i + 1) ($($starts[$i].Detail)): MelCat's moves did not reset its idle time"
+        }
+        Assert ($largestIdle -le $idleLimit) ('the session was idle for {0:N2} s while MelCat strolled every few seconds: its moves did not keep the idle time down' -f ($largestIdle / 1000.0))
     }
 
     # =======================================================================
@@ -1075,6 +1197,32 @@ namespace MelCatSmoke.Input
             Assert ($moves.Count -eq 0) "MelCat moved the pointer after the $kind stopped the stroll: $($moves -join ' ')"
         }
         [MelCatSmoke.Stroll.Sampler]::Stop()
+    }
+
+    # =======================================================================
+    # key-release: a key's release alone is not a person (macOS counts key
+    # presses and modifier changes only), so the stroll plays out.
+
+    Invoke-Step 'key-release' {
+        $park = Get-ScreenCenter
+        $mark = Restart-MelCat -Intensity 'Gentle' -Park $park
+        $waited = [MelCatSmoke.Stroll.Mouse]::WaitForMove(15000)
+        Assert ($waited -ge 0) 'no stroll started within 15 s of parking the pointer'
+        Start-Sleep -Milliseconds 60
+        $at = [MelCatSmoke.Stroll.Mouse]::Cursor()
+        $sentAt = [DateTime]::Now
+        $sentMs = [MelCatSmoke.Stroll.Sampler]::Now()
+        if (-not [MelCatSmoke.Input.Send]::Key(0x7C, $true)) { throw "SendInput failed for the F13 release: $([MelCatSmoke.Input.Send]::LastError)" }
+        $end = Wait-Log 'stroll (stopped: |finished at )' $mark 5000
+        [MelCatSmoke.Stroll.Sampler]::Stop()
+        $events = @(Get-StrollEvents $mark)
+        $later = @([MelCatSmoke.Stroll.Sampler]::Changes() | Where-Object { $_.Ms -gt $sentMs + 50 })
+        Note "log: $(Format-StrollEvents $events)"
+        $delay = if ($events.Count -ge 2) { ($events[1].Time - $sentAt).TotalMilliseconds } else { [double]::NaN }
+        Note ('a lone F13 release (no press before it) at {0}, 60 ms after the stroll''s first visible move; the stroll ended {1:N0} ms later: ''{2}''; moves after the release: {3}' -f $at, $delay, $(if ($end) { Get-LogText $end } else { 'no end within 5 s' }), $later.Count)
+        Assert ($null -ne $end) 'the stroll neither stopped nor finished within 5 s of the F13 release'
+        Assert ($end -match 'stroll finished at ') "a lone key release stopped the stroll: '$(Get-LogText $end)'"
+        Assert ((Get-StrollKinds $events) -eq 'started finished') "expected one stroll that plays out: $(Get-StrollKinds $events)"
     }
 
     # =======================================================================
@@ -1366,6 +1514,101 @@ namespace MelCatSmoke.Kill
     }
 
     # =======================================================================
+    # held-button: a button held during a stroll is a hand on the mouse.
+
+    $jiggleHeldButtonHelpers = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace MelCatSmoke.JiggleHeldButton
+{
+    public static class Native
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+        [StructLayout(LayoutKind.Explicit)]
+        public struct InputUnion { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct INPUT { public uint type; public InputUnion u; }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern uint SendInput(uint count, [In, MarshalAs(UnmanagedType.LPArray)] INPUT[] inputs, int size);
+    }
+
+    public static class Button
+    {
+        public static string LastError = "";
+
+        /// The left button pressed (or released) where the pointer is, like
+        /// a person's (dwExtraInfo 0); no MOUSEEVENTF_MOVE, so the pointer stays put.
+        public static bool Left(bool down)
+        {
+            Native.INPUT input = new Native.INPUT();
+            input.type = 0;
+            input.u.mi.dwFlags = down ? 0x0002u : 0x0004u;  // LEFTDOWN or LEFTUP
+            input.u.mi.dwExtraInfo = IntPtr.Zero;
+            uint inserted = Native.SendInput(1, new Native.INPUT[] { input }, Marshal.SizeOf(typeof(Native.INPUT)));
+            if (inserted != 1)
+            {
+                LastError = "SendInput inserted " + inserted + " of 1 events, error " + Marshal.GetLastWin32Error();
+                return false;
+            }
+            return true;
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $jiggleHeldButtonHelpers -Language CSharp
+
+    Invoke-Step 'held-button' {
+        # The press lands on the script's own test button, never on the
+        # runner's terminal.
+        [MelCatSmoke.Kill.Ui]::Close()
+        $p = $script:Primary
+        $startError = [MelCatSmoke.Kill.Ui]::Start($p.Right - 280, $p.Top + 40, 240, 120)
+        if ($startError) { throw "the test window failed: $startError" }
+        $button = [MelCatSmoke.Kill.Ui]::ButtonRect()
+        $cx = [int][Math]::Floor(($button[0] + $button[2]) / 2)
+        $cy = [int][Math]::Floor(($button[1] + $button[3]) / 2)
+        for ($try = 1; ($try -le 3) -and (-not [MelCatSmoke.Kill.Ui]::ButtonAt($cx, $cy)); $try++) {
+            Note "the test button is covered: $([MelCatSmoke.Kill.Ui]::Describe($cx, $cy)); raising it"
+            [MelCatSmoke.Kill.Ui]::Raise()
+            Start-Sleep -Milliseconds 300
+        }
+        Assert ([MelCatSmoke.Kill.Ui]::ButtonAt($cx, $cy)) "the test button is not under $cx,${cy}: $([MelCatSmoke.Kill.Ui]::Describe($cx, $cy))"
+        $mark = Restart-MelCat -Intensity 'Gentle' -Park @($cx, $cy)
+        $waited = [MelCatSmoke.Stroll.Mouse]::WaitForMove(15000)
+        Assert ($waited -ge 0) 'no stroll started within 15 s of parking the pointer'
+        Start-Sleep -Milliseconds 60
+        $at = [MelCatSmoke.Stroll.Mouse]::Cursor()
+        $xy = @($at -split ',' | ForEach-Object { [int]$_ })
+        Assert ([MelCatSmoke.Kill.Ui]::ButtonAt($xy[0], $xy[1])) "the pointer at $at is not over the test button: $([MelCatSmoke.Kill.Ui]::Describe($xy[0], $xy[1]))"
+        $sentAt = [DateTime]::Now
+        $sentMs = [MelCatSmoke.Stroll.Sampler]::Now()
+        if (-not [MelCatSmoke.JiggleHeldButton.Button]::Left($true)) { throw "SendInput failed for the press: $([MelCatSmoke.JiggleHeldButton.Button]::LastError)" }
+        Start-Sleep -Milliseconds 100
+        if (-not [MelCatSmoke.JiggleHeldButton.Button]::Left($false)) { throw "SendInput failed for the release: $([MelCatSmoke.JiggleHeldButton.Button]::LastError)" }
+        $stop = Wait-Log 'stroll (stopped: |finished at )' $mark 3000
+        $rest = 1500 - ([MelCatSmoke.Stroll.Sampler]::Now() - $sentMs)
+        if ($rest -gt 0) { Start-Sleep -Milliseconds $rest }
+        [MelCatSmoke.Stroll.Sampler]::Stop()
+        $moves = @([MelCatSmoke.Stroll.Sampler]::Changes() | Where-Object { ($_.Ms -ge $sentMs + 200) -and ($_.Ms -le $sentMs + 1500) })
+        $events = @(Get-StrollEvents $mark)
+        $held = [MelCatSmoke.Kill.Clicker]::Held()
+        [MelCatSmoke.Kill.Ui]::Close()
+        Note "log: $(Format-StrollEvents $events)"
+        $delay = if ($events.Count -ge 2) { ($events[1].Time - $sentAt).TotalMilliseconds } else { [double]::NaN }
+        Note ('left button held 100 ms at {0} (over the test button), 60 ms after the stroll''s first visible move; logged {1:N0} ms after the press: ''{2}''; moves 0.2 to 1.5 s later: {3}; held afterwards: {4}' -f $at, $delay, $(if ($stop) { Get-LogText $stop } else { 'nothing' }), $moves.Count, $(if ($held) { $held } else { 'nothing' }))
+        Assert ($null -ne $stop) 'the stroll neither stopped nor finished within 3 s of the press'
+        Assert ($stop -match 'stroll stopped: pointer moved$') "a held button did not stop the stroll as a hand on the mouse: '$(Get-LogText $stop)'"
+        Assert ((Get-StrollKinds $events) -eq 'started stopped') "expected one stroll, stopped by the held button: $(Get-StrollKinds $events)"
+        Assert ($moves.Count -eq 0) "MelCat moved the pointer after the held button stopped the stroll: $($moves -join ' ')"
+        Assert ($held -eq '') "held after the release: $held"
+    }
+
+    # =======================================================================
     # first-launch
 
     $firstLaunchHelpers = @'
@@ -1476,6 +1719,71 @@ namespace MelCatSmoke.FirstLaunch
 '@
     Add-Type -TypeDefinition $firstLaunchHelpers -ReferencedAssemblies System.Drawing -Language CSharp
 
+    # Enter on the settings window's Preview button (used by 'first-launch').
+    $jigglePreviewEnterHelpers = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace MelCatSmoke.JigglePreviewEnter
+{
+    public static class Dialog
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct RECT { public int Left; public int Top; public int Right; public int Bottom; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT { public int X; public int Y; }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct GUITHREADINFO
+        {
+            public uint cbSize; public uint flags;
+            public IntPtr hwndActive; public IntPtr hwndFocus; public IntPtr hwndCapture;
+            public IntPtr hwndMenuOwner; public IntPtr hwndMoveSize; public IntPtr hwndCaret;
+            public RECT rcCaret;
+        }
+        [DllImport("user32.dll")] static extern IntPtr GetDlgItem(IntPtr window, int id);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr hwnd, out RECT rect);
+        [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT point);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+        [DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread, ref GUITHREADINFO info);
+        [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
+
+        /// The child window of `window` with control id `id`, or zero.
+        public static IntPtr Item(IntPtr window, int id) { return GetDlgItem(window, id); }
+
+        /// The screen point in the middle of `hwnd`.
+        public static int[] Center(IntPtr hwnd)
+        {
+            RECT r;
+            GetWindowRect(hwnd, out r);
+            return new int[] { (r.Left + r.Right) / 2, (r.Top + r.Bottom) / 2 };
+        }
+
+        /// True when `hwnd` is the window at (x, y).
+        public static bool At(IntPtr hwnd, int x, int y)
+        {
+            POINT p = new POINT();
+            p.X = x;
+            p.Y = y;
+            return WindowFromPoint(p) == hwnd;
+        }
+
+        /// The window with the keyboard focus on the thread of `window`, or zero.
+        public static IntPtr Focus(IntPtr window)
+        {
+            uint pid;
+            uint thread = GetWindowThreadProcessId(window, out pid);
+            GUITHREADINFO info = new GUITHREADINFO();
+            info.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+            if (!GetGUIThreadInfo(thread, ref info)) return IntPtr.Zero;
+            return info.hwndFocus;
+        }
+
+        public static IntPtr Foreground() { return GetForegroundWindow(); }
+    }
+}
+'@
+    Add-Type -TypeDefinition $jigglePreviewEnterHelpers -Language CSharp
+
     Invoke-Step 'first-launch' {
         Close-MelCat
         foreach ($path in @($SettingsPath, "$SettingsPath.tmp")) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
@@ -1497,6 +1805,32 @@ namespace MelCatSmoke.FirstLaunch
         $shot = Join-Path $ArtifactsDir 'settings-window.png'
         $err = [MelCatSmoke.FirstLaunch.Win]::Shot($shot, $rect)
         if ($err) { Note "settings window screenshot failed: $err" } else { Note "settings window screenshot: settings-window.png" }
+
+        # --- Enter on a focused Preview plays a whole preview ----------------
+        # A click on Preview gives it the focus and plays one preview. Enter
+        # then presses Preview on its key-down; the release of the same key,
+        # about 100 ms into the new preview, must not stop it.
+        $preview = [MelCatSmoke.JigglePreviewEnter.Dialog]::Item($hwnd, 135)
+        Assert ($preview -ne [IntPtr]::Zero) 'the settings window has no Preview button (control id 135)'
+        $center = [MelCatSmoke.JigglePreviewEnter.Dialog]::Center($preview)
+        Assert ([MelCatSmoke.JigglePreviewEnter.Dialog]::At($preview, $center[0], $center[1])) "the Preview button is covered at $($center -join ',')"
+        $clickMark = Get-LogMark
+        if (-not [MelCatSmoke.Kill.Clicker]::Click($center[0], $center[1], 40)) { throw "SendInput failed for the click on Preview: $([MelCatSmoke.Kill.Clicker]::LastError)" }
+        $clicked = Wait-Log 'stroll (stopped: |finished at )' $clickMark 6000
+        Note "a click on Preview at $($center -join ','): log: $(Format-StrollEvents @(Get-StrollEvents $clickMark))"
+        Assert ($null -ne $clicked) 'a click on Preview played no preview that ended within 6 s'
+        $focused = Wait-Until { ([MelCatSmoke.JigglePreviewEnter.Dialog]::Focus($hwnd) -eq $preview) -and ([MelCatSmoke.JigglePreviewEnter.Dialog]::Foreground() -eq $hwnd) } 2000
+        Assert $focused ('Preview does not have the focus after the click: focus 0x{0:X}, foreground 0x{1:X}, Preview 0x{2:X}' -f [MelCatSmoke.JigglePreviewEnter.Dialog]::Focus($hwnd).ToInt64(), [MelCatSmoke.JigglePreviewEnter.Dialog]::Foreground().ToInt64(), $preview.ToInt64())
+        $enterMark = Get-LogMark
+        if (-not [MelCatSmoke.Input.Send]::Tap(0x0D, 100)) { throw "SendInput failed for Enter: $([MelCatSmoke.Input.Send]::LastError)" }
+        $entered = Wait-Log 'stroll (stopped: |finished at )' $enterMark 6000
+        $enterEvents = @(Get-StrollEvents $enterMark)
+        Note "Enter held 100 ms on the focused Preview: log: $(Format-StrollEvents $enterEvents)"
+        Assert ([MelCatSmoke.FirstLaunch.Win]::Exists($hwnd)) 'Enter closed the settings window instead of pressing Preview'
+        Assert ($null -ne $entered) 'Enter on Preview played no preview that ended within 6 s'
+        Assert ($entered -match 'stroll finished at ') "the release of Enter stopped the preview it started: '$(Get-LogText $entered)'"
+        Assert ((Get-StrollKinds $enterEvents) -eq 'started finished') "expected one preview that plays out: $(Get-StrollKinds $enterEvents)"
+        # ---------------------------------------------------------------------
 
         $err = [MelCatSmoke.FirstLaunch.Win]::Close($hwnd)
         Assert ($err -eq '') "could not post WM_CLOSE to the settings window: $err"
@@ -1522,6 +1856,7 @@ namespace MelCatSmoke.FirstLaunch
     Save-Desktop 'aborted'
 } finally {
     try { [MelCatSmoke.Stroll.Sampler]::Stop() } catch { }
+    try { [MelCatSmoke.JiggleIdle.IdleWatch]::Stop() } catch { }
     try { [MelCatSmoke.Kill.Ui]::Close() } catch { }
     Stop-MelCat
     Save-Desktop 'final'
