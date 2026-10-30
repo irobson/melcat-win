@@ -16,7 +16,8 @@
 //!    on the cursor check), and the session monitor (`jiggle::session` on
 //!    `MelCat.Main`).
 //! 5. Loads `Settings` (shared with the settings window as
-//!    `Rc<RefCell<Settings>>`), adds the tray icon (retrying on
+//!    `Rc<RefCell<Settings>>`) and notes the file's stamp (modification
+//!    time and size, `Settings::stamp_of`), adds the tray icon (retrying on
 //!    `TRAY_RETRY_TIMER` every 2 s, up to 30 times, if Explorer is not ready;
 //!    logs `tray icon added` once it is there), starts `TICK_TIMER`, and runs
 //!    one tick at once. If `settings.json` did not exist at start (first
@@ -25,11 +26,19 @@
 //!    `IsDialogMessageW` first, until Quit. Returns the exit code.
 //!
 //! Messages:
-//! - `TICK_TIMER`: `jiggler.tick(&settings, || session.is_away())` (the
-//!   jiggler asks only when a stroll could start); on a status
-//!   change, update the tray: `tray.set_active(status.is_active())` and the
+//! - `TICK_TIMER`: first, if the stamp of `settings.json` differs from the
+//!   one noted when MelCat last read or saved it (someone edited the file),
+//!   reload it (`Settings::read_from`), log `settings reloaded: <settings>`
+//!   and refresh an open settings window, like the macOS app reading its
+//!   defaults through on every tick. A file that cannot be read or parsed is
+//!   logged and the settings in force are kept; so are they when the file is
+//!   removed. Then `jiggler.tick(&settings, || session.is_away())` (the
+//!   jiggler asks only when a stroll could start); on a status change or a
+//!   reload, update the tray: `tray.set_active(status.is_active())` and the
 //!   tooltip `MelCat: <status line>` (`ui::text::status_line`). The tooltip
 //!   is also refreshed once a minute, so "tomorrow" and "today" stay right.
+//!   The same tick also runs after every settings change and before the tray
+//!   menu opens, so the menu shows an edited file at once.
 //! - `WALK_TIMER`: `jiggler.on_walk_timer()`.
 //! - `WM_INPUT`: `if watch::is_personal_input(lparam) { jiggler.note_personal_input() }`,
 //!   then `DefWindowProcW`.
@@ -39,13 +48,14 @@
 //!   anchor. A click within 300 ms of the menu closing is the click that
 //!   closed it and does not reopen it.
 //! - Menu commands: `SetMode`, `SetIntensity`, `SetIdleInterval` change the
-//!   settings, save them (`Settings::save`; a failure is a warning balloon),
+//!   settings, save them (`Settings::save`, then note the new stamp, so the
+//!   save is not taken for an edit; a failure is a warning balloon),
 //!   tick at once and refresh an open settings window. `OpenSettings` opens or
 //!   activates the settings window. `ToggleLaunchAtLogin` calls
 //!   `ui::autostart::set_enabled` (an error is a warning balloon).
 //!   `OpenLog` opens `util::log::log_file()` with `ShellExecuteW` "open".
 //!   `Quit` leaves the loop.
-//! - `WM_APP_SETTINGS_CHANGED`: save, tick at once, update the tray.
+//! - `WM_APP_SETTINGS_CHANGED`: save (as above), tick at once, update the tray.
 //!   `WM_APP_PREVIEW`: `jiggler.preview(settings.intensity)`.
 //!   `WM_APP_SETTINGS_CLOSED`: drop the settings window handle.
 //! - `WM_WTSSESSION_CHANGE`, `WM_POWERBROADCAST`: forward to the session
@@ -82,10 +92,9 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::time::{Duration, Instant as Clock};
+use std::time::{Duration, Instant as Clock, SystemTime};
 
 use melcat_core::{ChronoCalendar, Instant};
 use windows::core::{w, HSTRING, PCWSTR};
@@ -111,8 +120,8 @@ use crate::jiggle::jiggler::Jiggler;
 use crate::jiggle::session::SessionMonitor;
 use crate::jiggle::{pointer, watch, Status};
 use crate::messages::{
-    sentence, TICK_MILLIS, TICK_TIMER, TRAY_RETRY_TIMER, WALK_TIMER, WM_APP_PREVIEW, WM_APP_SETTINGS_CHANGED,
-    WM_APP_SETTINGS_CLOSED, WM_APP_TRAY,
+    io_error_text, sentence, TICK_MILLIS, TICK_TIMER, TRAY_RETRY_TIMER, WALK_TIMER, WM_APP_PREVIEW,
+    WM_APP_SETTINGS_CHANGED, WM_APP_SETTINGS_CLOSED, WM_APP_TRAY,
 };
 use crate::settings::{sanitize_interval, Settings};
 use crate::ui::menu_model::{build_menu, Command, MenuEntry, MenuState};
@@ -174,9 +183,10 @@ fn menu_blocked(open: bool, closed_at: Option<Clock>, now: Clock) -> bool {
     open || closed_at.is_some_and(|closed| now.saturating_duration_since(closed) < MENU_REOPEN_GUARD)
 }
 
-/// The balloon text when the settings file cannot be written. Whole sentences.
-fn save_failure_text(error: &dyn Display) -> String {
-    format!("{} The change applies until MelCat quits.", sentence(&error.to_string()))
+/// The balloon text when the settings file cannot be written. Whole
+/// sentences: "Access is denied (error 5). The change applies until MelCat quits."
+fn save_failure_text(error: &std::io::Error) -> String {
+    format!("{} The change applies until MelCat quits.", sentence(&io_error_text(error)))
 }
 
 /// A Windows error as a sentence for the user: its message, or its code when
@@ -259,12 +269,15 @@ fn run_app() -> i32 {
     SESSION.with(|slot| *slot.borrow_mut() = Some(SessionMonitor::register(main)));
 
     let first_launch = !Settings::path().exists();
+    // Noted before reading, so an edit made in between is reloaded at the first tick.
+    let settings_stamp = Settings::stamp_of(&Settings::path());
     let settings = Settings::load();
     crate::log_info!("settings: {settings:?}");
     let controller = Controller {
         main,
         msg,
         settings: Rc::new(RefCell::new(settings)),
+        settings_stamp,
         jiggler: Jiggler::new(msg),
         tray: Tray::new(main),
         tray_retrying: false,
@@ -644,6 +657,9 @@ struct Controller {
     /// Shared with the settings window, which writes changes into it. Never
     /// borrowed across a call into another module.
     settings: Rc<RefCell<Settings>>,
+    /// `settings.json`'s stamp when MelCat last read or saved it; another one
+    /// means someone else wrote the file.
+    settings_stamp: Option<(SystemTime, u64)>,
     jiggler: Jiggler,
     tray: Tray,
     /// True while `TRAY_RETRY_TIMER` runs.
@@ -731,11 +747,38 @@ impl Controller {
 
     /// The once-a-second check, also run after any settings change.
     fn tick(&mut self) {
+        let reloaded = self.reload_if_edited();
         let settings = self.current();
         let changed = self.jiggler.tick(&settings, session_is_away).is_some();
         let now = paths::now();
-        if changed || tip_is_stale(self.tip_minute, now) {
+        if changed || reloaded || tip_is_stale(self.tip_minute, now) {
             self.show_status(now);
+        }
+    }
+
+    /// Reloads `settings.json` when someone else wrote it since MelCat last
+    /// read or saved it. True when the settings were replaced.
+    fn reload_if_edited(&mut self) -> bool {
+        let path = Settings::path();
+        let stamp = Settings::stamp_of(&path);
+        if stamp == self.settings_stamp {
+            return false;
+        }
+        // Noted before reading, so a write that lands meanwhile is read next time.
+        self.settings_stamp = stamp;
+        match Settings::read_from(&path) {
+            Ok(Some(settings)) => {
+                crate::log_info!("settings reloaded: {settings:?}");
+                *self.settings.borrow_mut() = settings;
+                self.refresh_settings_window();
+                true
+            }
+            // Removed: the settings in force stay, and the next change writes the file again.
+            Ok(None) => false,
+            Err(reason) => {
+                crate::log_warn!("{reason}; keeping the current settings");
+                false
+            }
         }
     }
 
@@ -755,10 +798,14 @@ impl Controller {
         self.tray.balloon(title, &sentence(text), Balloon::Warning);
     }
 
-    fn save_settings(&self) {
-        if let Err(error) = self.current().save() {
-            crate::log_error!("could not save the settings: {error}");
-            self.notice("Could not save the settings", &save_failure_text(&error));
+    fn save_settings(&mut self) {
+        match self.current().save() {
+            // MelCat's own write is not an edit to reload.
+            Ok(()) => self.settings_stamp = Settings::stamp_of(&Settings::path()),
+            Err(error) => {
+                crate::log_error!("could not save the settings: {error}");
+                self.notice("Could not save the settings", &save_failure_text(&error));
+            }
         }
     }
 
@@ -1013,13 +1060,14 @@ mod tests {
 
     #[test]
     fn notices_are_whole_sentences() {
-        let error = std::io::Error::other("Access is denied. (os error 5)");
-        let text = save_failure_text(&error);
-        assert_eq!(text, "Access is denied. (os error 5). The change applies until MelCat quits.");
-        let bare = save_failure_text(&"disk full");
+        // io::Error's own text is "Access is denied. (os error 5)".
+        let denied = save_failure_text(&std::io::Error::from_raw_os_error(5));
+        assert!(denied.ends_with(" (error 5). The change applies until MelCat quits."), "{denied}");
+        let bare = save_failure_text(&std::io::Error::other("disk full"));
         assert_eq!(bare, "Disk full. The change applies until MelCat quits.");
-        for text in [text, bare] {
+        for text in [denied, bare] {
             assert!(!text.contains(".."), "{text}");
+            assert!(!text.contains(". ("), "{text}");
             // A balloon holds 255 characters.
             assert!(text.chars().count() <= 255, "{text}");
         }
