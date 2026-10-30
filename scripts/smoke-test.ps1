@@ -6,9 +6,12 @@
     Steps (each reports PASSED, FAILED or SKIPPED with its evidence):
 
       exe           MelCat.exe is a 64-bit GUI executable with MelCat's
-                    version info (ProductName MelCat, the workspace version),
-                    an icon, and a manifest asking for PerMonitorV2 DPI
-                    awareness and common controls v6.
+                    version info (ProductName MelCat; FileVersion,
+                    ProductVersion and both version numbers are the workspace
+                    version), an icon (icon group 1, RT_GROUP_ICON, with every
+                    image it names), and a manifest whose assemblyIdentity
+                    version is the workspace version too, asking for
+                    PerMonitorV2 DPI awareness and common controls v6.
       start         With {mode Always, Gentle, idle 5 s} MelCat starts, logs
                     'MelCat <version> starting' and 'tray icon added', and
                     Shell_NotifyIconGetRect finds the tray icon of its
@@ -21,7 +24,8 @@
                     (GetCursorPos every millisecond or so) stays within the
                     Gentle radius of the parking spot (5 pt, +1 px for
                     rounding); more strolls follow while idle, 2.5 to 5 s
-                    apart, 4 in all, without drifting from the spot.
+                    apart (5.05 s allowed for the log time stamps), 4 in all,
+                    without drifting from the spot.
       edges         With Playful (12 pt), parked 2 px from the top-left corner
                     and then exactly at (0,0): over several strolls no sampled
                     position comes closer than 2 px to a screen edge once it
@@ -36,7 +40,8 @@
                     and a wheel notch during another each stop the stroll
                     ('stroll stopped: input'), and the pointer is let go.
       off           With mode Off, no stroll starts and the pointer stays put
-                    over 12 s of idleness, and the log says 'status: off'.
+                    over 12 s of idleness, the log says 'status: off', and
+                    MelCat is still running afterwards.
       kill-mid-stroll
                     MelCat killed (Stop-Process -Force) during a stroll leaves
                     nothing behind: the pointer stays still, an injected move
@@ -47,13 +52,39 @@
                     visible top-level MelCat.Settings window of its process; a
                     screenshot is saved); WM_CLOSE closes it, settings.json
                     then exists, and MelCat keeps running until asked to quit.
+                    Then a clean quit: WM_CLOSE to MelCat.Main ends MelCat
+                    within 5 s with exit code 0, it logs 'MelCat stopped', and
+                    the shell no longer knows its tray icon (NIM_DELETE ran).
+      settings-bom  settings.json written with a byte order mark (UTF-8, as
+                    Notepad and Set-Content -Encoding UTF8 write it; UTF-16 LE,
+                    as Out-File and '>' write it; UTF-16 BE) holding mode Off,
+                    Sunday and Saturday, Playful and 5 s: MelCat loads every
+                    value (its 'settings:' line) and its first status is 'off'.
+                    A settings.json that is not JSON leaves a warning in the
+                    log, and MelCat runs with the defaults.
+      settings-reload
+                    With MelCat running in mode Always, settings.json edited
+                    to mode Off applies within 3 s ('settings reloaded',
+                    'status: off'), and no stroll starts and the pointer stays
+                    put for 8 s after. Then MelCat's own save (posting
+                    WM_APP_SETTINGS_CHANGED, 0x8002, to its MelCat.Msg
+                    window) keeps mode Off in the file and is not taken for
+                    an edit (no 'settings reloaded' in the 2.5 s after it).
+      save-failure  With a folder in the way of settings.json.tmp, a save
+                    (WM_APP_SETTINGS_CHANGED) fails and the balloon (its
+                    'notice:' log line) reads as whole sentences, such as
+                    'Access is denied (error 5). The change applies until
+                    MelCat quits.', not 'Access is denied. (os error 5). ...'.
+                    MelCat keeps running.
 
     Each step from 'stroll' on starts its own MelCat: it asks any MelCat still
-    running to quit (WM_CLOSE to MelCat.Main), writes
+    running to quit (WM_CLOSE to MelCat.Main; the step fails unless it quits
+    within 5 s with exit code 0), writes
     %APPDATA%\MelCat\settings.json (idle interval 5 s, the shortest), parks
     the pointer with one injected move, starts the pointer sampler and then
-    MelCat.exe. Input is injected with SendInput and dwExtraInfo 0, like a
-    person's.
+    MelCat.exe. (first-launch removes settings.json instead, and
+    settings-bom writes its own.) Input is injected with SendInput and
+    dwExtraInfo 0, like a person's.
 
     MelCat is always stopped at the end, its log printed and copied, and the
     script exits non-zero if any step FAILED. Artifacts (log, desktop
@@ -428,6 +459,66 @@ function Get-ScreenCenter {
 
 $exitCode = 0
 try {
+    # -----------------------------------------------------------------------
+    # exe: the icon resource (MelCatSmoke.AppExe)
+
+    $appExeHelpers = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace MelCatSmoke.AppExe
+{
+    public static class Res
+    {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern IntPtr LoadLibraryEx(string path, IntPtr file, uint flags);
+        [DllImport("kernel32.dll")] static extern bool FreeLibrary(IntPtr module);
+        [DllImport("kernel32.dll")] static extern IntPtr FindResource(IntPtr module, IntPtr name, IntPtr type);
+        [DllImport("kernel32.dll")] static extern IntPtr LoadResource(IntPtr module, IntPtr info);
+        [DllImport("kernel32.dll")] static extern IntPtr LockResource(IntPtr data);
+        [DllImport("kernel32.dll")] static extern uint SizeofResource(IntPtr module, IntPtr info);
+
+        /// The images of icon group `id` (RT_GROUP_ICON) of an executable,
+        /// such as "16x16 32bpp, 256x256 32bpp", or "" when the group is
+        /// missing or empty, or names an image (RT_ICON) the file lacks.
+        public static string IconGroup(string path, int id)
+        {
+            IntPtr module = LoadLibraryEx(path, IntPtr.Zero, 0x00000002 /* LOAD_LIBRARY_AS_DATAFILE */);
+            if (module == IntPtr.Zero) return "";
+            try
+            {
+                IntPtr info = FindResource(module, new IntPtr(id), new IntPtr(14) /* RT_GROUP_ICON */);
+                if (info == IntPtr.Zero) return "";
+                uint size = SizeofResource(module, info);
+                if (size < 6) return "";
+                byte[] dir = new byte[size];
+                Marshal.Copy(LockResource(LoadResource(module, info)), dir, 0, (int)size);
+                int count = BitConverter.ToUInt16(dir, 4);
+                if (count == 0 || size < 6 + 14 * count) return "";
+                StringBuilder images = new StringBuilder();
+                for (int i = 0; i < count; i++)
+                {
+                    // GRPICONDIRENTRY: width, height, colors, reserved, planes, bit count, bytes, id.
+                    int entry = 6 + 14 * i;
+                    int width = dir[entry] == 0 ? 256 : dir[entry];
+                    int height = dir[entry + 1] == 0 ? 256 : dir[entry + 1];
+                    int bits = BitConverter.ToUInt16(dir, entry + 6);
+                    int image = BitConverter.ToUInt16(dir, entry + 12);
+                    IntPtr icon = FindResource(module, new IntPtr(image), new IntPtr(3) /* RT_ICON */);
+                    if (icon == IntPtr.Zero || SizeofResource(module, icon) == 0) return "";
+                    if (images.Length > 0) images.Append(", ");
+                    images.Append(width + "x" + height + " " + bits + "bpp");
+                }
+                return images.ToString();
+            }
+            finally { FreeLibrary(module); }
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $appExeHelpers -Language CSharp
+
     Invoke-Step 'exe' {
         Assert (Test-Path -LiteralPath $Exe) "MelCat.exe not found at $Exe"
         $bytes = [System.IO.File]::ReadAllBytes($Exe)
@@ -444,15 +535,31 @@ try {
         $cargo = Get-Content -Raw -LiteralPath (Join-Path $PSScriptRoot '..\Cargo.toml')
         $version = [regex]::Match($cargo, '(?m)^version\s*=\s*"([^"]+)"').Groups[1].Value
         Assert ($info.ProductVersion -eq $version) "ProductVersion '$($info.ProductVersion)' is not the workspace version '$version'"
+        # The workspace version as four numbers, as VERSIONINFO and the manifest hold it.
+        $numbers = @(($version -split '[-+]')[0].Split('.'))
+        while ($numbers.Count -lt 4) { $numbers += '0' }
+        $version4 = $numbers -join '.'
+        $fileNumbers = '{0}.{1}.{2}.{3}' -f $info.FileMajorPart, $info.FileMinorPart, $info.FileBuildPart, $info.FilePrivatePart
+        $productNumbers = '{0}.{1}.{2}.{3}' -f $info.ProductMajorPart, $info.ProductMinorPart, $info.ProductBuildPart, $info.ProductPrivatePart
+        Note "ProductVersion '$($info.ProductVersion)'; FILEVERSION $fileNumbers, PRODUCTVERSION $productNumbers"
+        Assert ($info.FileVersion -eq $version) "FileVersion '$($info.FileVersion)' is not the workspace version '$version'"
+        Assert ($fileNumbers -eq $version4) "FILEVERSION $fileNumbers is not the workspace version $version4"
+        Assert ($productNumbers -eq $version4) "PRODUCTVERSION $productNumbers is not the workspace version $version4"
 
-        $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($Exe)
-        Note "icon: $($icon.Width)x$($icon.Height)"
+        # ExtractAssociatedIcon falls back to a stock shell icon, so read the resource itself.
+        $icons = [MelCatSmoke.AppExe.Res]::IconGroup($Exe, 1)
+        Note "icon group 1: $(if ($icons) { $icons } else { 'missing' })"
+        Assert ($icons -ne '') 'MelCat.exe has no icon: no icon group 1 (RT_GROUP_ICON) with all its images'
 
         $manifest = [MelCatSmoke.Win]::Manifest($Exe)
         Assert ($manifest -match 'PerMonitorV2') 'the manifest does not ask for PerMonitorV2 DPI awareness'
         Assert ($manifest -match 'Microsoft\.Windows\.Common-Controls') 'the manifest does not ask for common controls v6'
         Assert ($manifest -match 'asInvoker') 'the manifest does not run as invoker'
-        Note 'manifest: PerMonitorV2, common controls v6, asInvoker'
+        $identity = [regex]::Match($manifest, '<assemblyIdentity\b[^>]*\bname="dev\.melcat\.MelCat"[^>]*>')
+        Assert $identity.Success 'the manifest has no assemblyIdentity named dev.melcat.MelCat'
+        $manifestVersion = [regex]::Match($identity.Value, '\bversion="([^"]*)"').Groups[1].Value
+        Note "manifest: PerMonitorV2, common controls v6, asInvoker, version '$manifestVersion'"
+        Assert ($manifestVersion -eq $version4) "the manifest's assemblyIdentity version '$manifestVersion' is not the workspace version $version4"
     }
 
     # =======================================================================
@@ -502,17 +609,41 @@ namespace MelCatSmoke.Start
     Add-Type -TypeDefinition $startHelpers -Language CSharp
 
     # Asks every MelCat to quit (WM_CLOSE to its MelCat.Main window, like
-    # taskkill without /f) and kills any that still runs 5 s later.
-    function Close-MelCat {
+    # taskkill without /f) and kills any that still runs 5 s later. Returns ''
+    # when each one quit within 5 s of WM_CLOSE with exit code 0, otherwise
+    # what went wrong.
+    function Invoke-MelCatQuit {
+        $problems = New-Object System.Collections.Generic.List[string]
         foreach ($process in @(Get-Process -Name MelCat -ErrorAction SilentlyContinue)) {
+            try { $null = $process.Handle } catch { }  # keeps ExitCode readable after it ends
             $main = [MelCatSmoke.Start.Win]::FindOwned('MelCat.Main', $process.Id)
-            if ($main -ne [IntPtr]::Zero) { [void][MelCatSmoke.Start.Win]::Post($main, 0x0010) }
+            if ($main -eq [IntPtr]::Zero) {
+                $problems.Add("MelCat pid $($process.Id) has no MelCat.Main window")
+            } else {
+                $err = [MelCatSmoke.Start.Win]::Post($main, 0x0010)
+                if ($err) { $problems.Add("WM_CLOSE to MelCat pid $($process.Id): $err") }
+            }
             if (-not $process.WaitForExit(5000)) {
                 Write-Host "    (MelCat pid $($process.Id) did not quit on WM_CLOSE; killing it)"
+                $problems.Add("MelCat pid $($process.Id) still ran 5 s after WM_CLOSE")
                 Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
                 [void]$process.WaitForExit(5000)
+            } else {
+                $code = $null
+                try { $code = $process.ExitCode } catch { }
+                if (($null -ne $code) -and ($code -ne 0)) { $problems.Add(('MelCat pid {0} quit with exit code 0x{1:X8}' -f $process.Id, $code)) }
             }
         }
+        return ($problems -join '; ')
+    }
+
+    # Invoke-MelCatQuit, whatever the outcome.
+    function Close-MelCat { $null = Invoke-MelCatQuit }
+
+    # Invoke-MelCatQuit, failing the step unless every MelCat quit cleanly.
+    function Stop-MelCatCleanly {
+        $quit = Invoke-MelCatQuit
+        Assert ($quit -eq '') "MelCat did not quit cleanly on WM_CLOSE: $quit"
     }
 
     Write-Host ''
@@ -776,11 +907,12 @@ namespace MelCatSmoke.Stroll
         Assert $landed "a move injected to $X,$Y left the pointer at $([MelCatSmoke.Stroll.Mouse]::Cursor())"
     }
 
-    # Asks any MelCat to quit, writes the settings, parks the pointer (one
-    # injected move), starts the sampler, then MelCat, and waits for its
-    # first status line. Returns the log mark taken just before the start.
+    # Asks any MelCat to quit (failing unless it quits cleanly), writes the
+    # settings, parks the pointer (one injected move), starts the sampler,
+    # then MelCat, and waits for its first status line. Returns the log mark
+    # taken just before the start.
     function Restart-MelCat([string]$Mode = 'Always', [string]$Intensity = 'Gentle', [int[]]$Park = $null) {
-        Close-MelCat
+        Stop-MelCatCleanly
         Write-MelSettings $Mode $Intensity
         if ($null -ne $Park) { Set-Pointer $Park[0] $Park[1] }
         [MelCatSmoke.Stroll.Sampler]::Start()
@@ -837,14 +969,16 @@ namespace MelCatSmoke.Stroll
         }
 
         # Idle again after each stroll: the next one comes after a fresh
-        # threshold (75 to 100 % of 5 s, minus 1.2 s of tick slack), never
-        # later than the interval (plus a little timer jitter).
+        # threshold (75 to 100 % of 5 s, minus 1.2 s of tick slack: 2.55 to
+        # 3.8 s), at the first tick after it (up to 1 s, plus the 0.2 s the
+        # slack allows for timer jitter), so never later than the 5 s
+        # interval. 0.05 s more covers the log time stamps at both ends.
         $gaps = @()
         $ends = @($events | Where-Object { $_.Kind -eq 'finished' })
         for ($i = 0; $i -lt 3; $i++) { $gaps += ($starts[$i + 1].Time - $ends[$i].Time).TotalSeconds }
         Note ('pauses between strolls: {0} s; stroll lengths: {1} steps' -f (($gaps | ForEach-Object { '{0:N2}' -f $_ }) -join ', '), (($starts | ForEach-Object { $_.Steps }) -join ', '))
         foreach ($gap in $gaps) {
-            Assert (($gap -ge 2.5) -and ($gap -le 5.5)) ('a pause between two strolls lasted {0:N2} s, outside 2.5 to 5.5 s' -f $gap)
+            Assert (($gap -ge 2.5) -and ($gap -le 5.05)) ('a pause between two strolls lasted {0:N2} s, outside 2.5 to 5 s (5.05 s with the log time stamps)' -f $gap)
         }
     }
 
@@ -1094,6 +1228,9 @@ namespace MelCatSmoke.Input
         Assert ($idle -ge 12000) "the session was not idle for the whole 12 s ($idle ms)"
         Assert ($strolls.Count -eq 0) "a stroll started in mode Off: $(($strolls | ForEach-Object { Get-LogText $_ }) -join '; ')"
         Assert ($changes.Length -eq 1) "the pointer moved in mode Off: $($changes -join ' ')"
+        # MelCat must still be there: a crash right after 'status: off' passes everything above.
+        $code = if ($script:Mel.HasExited) { ', with code 0x{0:X8}' -f $script:Mel.ExitCode } else { '' }
+        Assert (-not $script:Mel.HasExited) "MelCat exited during the 12 s in mode Off$code"
     }
 
     # =======================================================================
@@ -1477,7 +1614,7 @@ namespace MelCatSmoke.FirstLaunch
     Add-Type -TypeDefinition $firstLaunchHelpers -ReferencedAssemblies System.Drawing -Language CSharp
 
     Invoke-Step 'first-launch' {
-        Close-MelCat
+        Stop-MelCatCleanly
         foreach ($path in @($SettingsPath, "$SettingsPath.tmp")) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
         Assert (-not (Test-Path -LiteralPath $SettingsPath)) "could not remove $SettingsPath"
         $mark = Get-LogMark
@@ -1511,10 +1648,189 @@ namespace MelCatSmoke.FirstLaunch
         Assert ($parsed.mode -eq 'Scheduled') "settings.json does not hold the default mode (Scheduled): $($parsed.mode)"
         Assert (-not $script:Mel.HasExited) 'MelCat quit when its settings window closed'
 
+        # A clean quit: WM_CLOSE to MelCat.Main ends MelCat within 5 s with
+        # exit code 0, it logs 'MelCat stopped', and its tray icon is gone.
         $mel = $script:Mel
-        Close-MelCat
+        $main = [MelCatSmoke.Start.Win]::FindOwned('MelCat.Main', $mel.Id)
+        Assert ($main -ne [IntPtr]::Zero) "no MelCat.Main window belongs to MelCat (pid $($mel.Id))"
+        $iconBefore = [MelCatSmoke.Win]::TrayIcon($main, 1)
+        $quit = Invoke-MelCatQuit
         $stopped = Wait-Log 'MelCat stopped$' $mark 3000
-        Note ('asked MelCat to quit (WM_CLOSE to MelCat.Main): exit code {0}, log: {1}' -f $mel.ExitCode, $(if ($stopped) { "'$(Get-LogText $stopped)'" } else { 'no ''MelCat stopped''' }))
+        $iconAfter = [MelCatSmoke.Win]::TrayIcon($main, 1)
+        $code = if ($mel.HasExited) { '0x{0:X8}' -f $mel.ExitCode } else { 'none (still running)' }
+        Note ('asked MelCat to quit (WM_CLOSE to MelCat.Main): {0}; exit code {1}; log: {2}; tray icon before: {3}, after: {4}' -f $(if ($quit) { $quit } else { 'quit within 5 s' }), $code, $(if ($stopped) { "'$(Get-LogText $stopped)'" } else { 'no ''MelCat stopped''' }), $iconBefore, $iconAfter)
+        Assert ($quit -eq '') "MelCat did not quit cleanly on WM_CLOSE: $quit"
+        Assert ($mel.HasExited -and ($mel.ExitCode -eq 0)) "MelCat's exit code is $code, not 0"
+        Assert ($null -ne $stopped) "MelCat logged no 'MelCat stopped' on its way out"
+        Assert ($iconBefore -match '^rect=') "the shell did not know MelCat's tray icon before it quit: $iconBefore"
+        Assert ($iconAfter -match '^error ') "MelCat's tray icon outlived it (no NIM_DELETE): Shell_NotifyIconGetRect says $iconAfter"
+    }
+
+    # =======================================================================
+    # settings-bom, settings-reload, save-failure: settings.json as other
+    # programs write it, edits while MelCat runs, and a save that fails
+    # (MelCatSmoke.AppSettings).
+
+    $appSettingsHelpers = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace MelCatSmoke.AppSettings
+{
+    public static class Win
+    {
+        static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint pid);
+        [DllImport("user32.dll", SetLastError = true)] static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wparam, IntPtr lparam);
+
+        /// The message-only MelCat.Msg window of process `pid`, or zero.
+        public static IntPtr FindMsg(int pid)
+        {
+            IntPtr hwnd = IntPtr.Zero;
+            while ((hwnd = FindWindowEx(HWND_MESSAGE, hwnd, "MelCat.Msg", null)) != IntPtr.Zero)
+            {
+                uint owner;
+                GetWindowThreadProcessId(hwnd, out owner);
+                if (owner == (uint)pid) return hwnd;
+            }
+            return IntPtr.Zero;
+        }
+
+        /// Posts `msg` without parameters; "" or the error.
+        public static string Post(IntPtr hwnd, uint msg)
+        {
+            if (PostMessage(hwnd, msg, IntPtr.Zero, IntPtr.Zero)) return "";
+            return "PostMessage error " + Marshal.GetLastWin32Error();
+        }
+    }
+}
+'@
+    Add-Type -TypeDefinition $appSettingsHelpers -Language CSharp
+
+    # WM_APP_SETTINGS_CHANGED (WM_APP + 2) to MelCat's MelCat.Msg window: the
+    # controller saves the settings it holds, as after a settings window change.
+    function Send-MelSave {
+        $msg = [MelCatSmoke.AppSettings.Win]::FindMsg($script:Mel.Id)
+        Assert ($msg -ne [IntPtr]::Zero) "no MelCat.Msg window belongs to MelCat (pid $($script:Mel.Id))"
+        $err = [MelCatSmoke.AppSettings.Win]::Post($msg, 0x8002)
+        Assert ($err -eq '') "could not post WM_APP_SETTINGS_CHANGED to MelCat.Msg: $err"
+    }
+
+    # A log line's time stamp.
+    function Get-LogTime([string]$Line) {
+        return [datetime]::ParseExact($Line.Substring(0, 23), 'yyyy-MM-dd HH:mm:ss.fff', $script:Invariant)
+    }
+
+    # Starts MelCat with settings.json as it is and waits for its first status
+    # line. Returns the log mark taken just before the start.
+    function Start-MelCatAsIs {
+        $mark = Get-LogMark
+        $script:Mel = Start-MelCat
+        $status = Wait-Log 'status: (off|napping|active)$' $mark 15000
+        Assert ($null -ne $status) "MelCat (pid $($script:Mel.Id)) logged no status within 15 s"
+        return $mark
+    }
+
+    Invoke-Step 'settings-bom' {
+        $json = '{"mode":"Off","days":[1,7],"start_minutes":540,"end_minutes":1080,"intensity":"Playful","idle_interval_secs":5}'
+        $cases = @(
+            @('UTF-8 with a byte order mark', (New-Object System.Text.UTF8Encoding $true), 'EF-BB-BF'),
+            @('UTF-16 LE with a byte order mark', [System.Text.Encoding]::Unicode, 'FF-FE'),
+            @('UTF-16 BE with a byte order mark', [System.Text.Encoding]::BigEndianUnicode, 'FE-FF'))
+        foreach ($case in $cases) {
+            $what = $case[0]
+            Stop-MelCatCleanly
+            New-Item -ItemType Directory -Force -Path (Split-Path $SettingsPath) | Out-Null
+            [System.IO.File]::WriteAllText($SettingsPath, $json, $case[1])
+            $bytes = [System.IO.File]::ReadAllBytes($SettingsPath)
+            $head = [BitConverter]::ToString($bytes, 0, [Math]::Min(4, $bytes.Length))
+            Assert ($head.StartsWith($case[2])) "settings.json written as $what starts with $head, not $($case[2])"
+            $mark = Start-MelCatAsIs
+            $status = @(Get-LogLines 'status: ' $mark)[0]
+            $loaded = @(Get-LogLines 'settings: Settings ' $mark)
+            $shown = if ($loaded.Count -gt 0) { Get-LogText $loaded[0] } else { 'no settings line' }
+            Note ("{0} ({1} ...): '{2}'; first status '{3}'" -f $what, $head, $shown, (Get-LogText $status))
+            Assert ($loaded.Count -ge 1) "MelCat logged no 'settings:' line"
+            Assert (($loaded[0] -match 'mode: Off,') -and ($loaded[0] -match 'days: Days\(65\)') -and ($loaded[0] -match 'intensity: Playful,') -and ($loaded[0] -match 'idle_interval: 5\.0 ')) "MelCat did not load settings.json written as ${what}: '$shown'"
+            Assert ($status -match 'status: off$') "with mode Off in settings.json written as $what, MelCat's first status is '$(Get-LogText $status)'"
+        }
+
+        # A file that is not JSON: the defaults, and a warning in the log.
+        Stop-MelCatCleanly
+        [System.IO.File]::WriteAllText($SettingsPath, 'not json')
+        $mark = Start-MelCatAsIs
+        $warning = @(Get-LogLines 'settings\.json is not a JSON object; using the defaults$' $mark)
+        $loaded = @(Get-LogLines 'settings: Settings ' $mark)
+        Note ("'not json': warning {0}; '{1}'" -f $(if ($warning.Count -gt 0) { "'$(Get-LogText $warning[0])'" } else { 'none' }), $(if ($loaded.Count -gt 0) { Get-LogText $loaded[0] } else { 'no settings line' }))
+        Assert ($warning.Count -ge 1) 'a settings.json that is not JSON left no warning in the log'
+        Assert (($loaded.Count -ge 1) -and ($loaded[0] -match 'mode: Scheduled,')) 'with a settings.json that is not JSON, MelCat did not use the defaults'
+    }
+
+    Invoke-Step 'settings-reload' {
+        $mark = Restart-MelCat -Mode 'Always' -Intensity 'Gentle' -Park (Get-ScreenCenter)
+        $first = @(Get-LogLines 'status: ' $mark)[0]
+        Assert ($first -match 'status: active$') "with mode Always MelCat's first status is '$(Get-LogText $first)'"
+
+        # Edited while MelCat runs: it applies within a second or so.
+        $edit = Get-LogMark
+        Write-MelSettings 'Off' 'Gentle'
+        $editedAt = [DateTime]::Now
+        $off = Wait-Log 'status: off$' $edit 3000
+        $reloads = @(Get-LogLines 'settings reloaded: ' $edit)
+        $after = if ($off) { '{0:N0} ms' -f ((Get-LogTime $off) - $editedAt).TotalMilliseconds } else { '-' }
+        Note ("settings.json edited to mode Off: {0}; then '{1}', {2} after the edit" -f $(if ($reloads.Count -gt 0) { "'$(Get-LogText $reloads[0])'" } else { "no 'settings reloaded'" }), $(if ($off) { Get-LogText $off } else { "no 'status: off' within 3 s" }), $after)
+        Assert ($null -ne $off) "MelCat did not switch to 'status: off' within 3 s of settings.json being edited to mode Off"
+        Assert (($reloads.Count -ge 1) -and ($reloads[0] -match 'mode: Off,')) "MelCat logged no 'settings reloaded: ... mode: Off'"
+
+        # Nothing moves from then on.
+        $afterOff = $edit + (Get-LogSince $edit).IndexOf($off)
+        $offMs = [MelCatSmoke.Stroll.Sampler]::MsAt((Get-LogTime $off))
+        Start-Sleep -Seconds 8
+        [MelCatSmoke.Stroll.Sampler]::Stop()
+        $strolls = @(Get-LogLines 'stroll started' $afterOff)
+        $moves = @([MelCatSmoke.Stroll.Sampler]::Changes() | Where-Object { $_.Ms -gt $offMs + 100 })
+        Note ("in the 8 s after 'status: off': {0} stroll(s) started; pointer moves: {1}" -f $strolls.Count, $(if ($moves.Count -gt 0) { $moves -join ' ' } else { 'none' }))
+        Assert ($strolls.Count -eq 0) "a stroll started after settings.json was edited to mode Off: $(($strolls | ForEach-Object { Get-LogText $_ }) -join '; ')"
+        Assert ($moves.Count -eq 0) "the pointer moved after settings.json was edited to mode Off: $($moves -join ' ')"
+        Assert (-not $script:Mel.HasExited) 'MelCat exited after reloading its settings'
+
+        # MelCat's own save keeps the edit and is not taken for another edit.
+        $save = Get-LogMark
+        $before = [MelCatSmoke.Win]::ReadShared($SettingsPath)
+        Send-MelSave
+        $saved = Wait-Until { [MelCatSmoke.Win]::ReadShared($SettingsPath) -ne $before } 3000
+        Start-Sleep -Milliseconds 2500  # two ticks or more
+        $json = [MelCatSmoke.Win]::ReadShared($SettingsPath)
+        $again = @(Get-LogLines 'settings reloaded' $save)
+        Note ("after WM_APP_SETTINGS_CHANGED: settings.json {0}: {1}; 'settings reloaded' lines since: {2}" -f $(if ($saved) { 'rewritten' } else { 'unchanged' }), ($json -replace '\s+', ' '), $again.Count)
+        Assert $saved 'MelCat did not save settings.json within 3 s of WM_APP_SETTINGS_CHANGED'
+        $mode = ($json | ConvertFrom-Json).mode
+        Assert ($mode -eq 'Off') "MelCat saved mode '$mode' over the edited mode Off"
+        Assert ($again.Count -eq 0) "MelCat took its own save for an edit: $(($again | ForEach-Object { Get-LogText $_ }) -join '; ')"
+    }
+
+    Invoke-Step 'save-failure' {
+        $tmp = "$SettingsPath.tmp"
+        $mark = Restart-MelCat -Mode 'Off' -Intensity 'Gentle'
+        [MelCatSmoke.Stroll.Sampler]::Stop()
+        # MelCat writes settings.json.tmp, then renames it; a folder of that name makes the write fail.
+        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+        try {
+            Send-MelSave
+            $line = Wait-Log 'notice: Could not save the settings: ' $mark 5000
+            $logged = @(Get-LogLines 'could not save the settings: ' $mark)
+            Assert ($null -ne $line) "no 'notice: Could not save the settings: ...' within 5 s of a save with $tmp in the way"
+            $text = (Get-LogText $line) -replace '^notice: Could not save the settings: ', ''
+            Note ("log: '{0}'; balloon: '{1}'" -f $(if ($logged.Count -gt 0) { Get-LogText $logged[0] } else { '-' }), $text)
+            Assert ($text -notmatch '\. \(') "the balloon has a period in the middle of a sentence: '$text'"
+            Assert ($text -notmatch '\.\.') "the balloon has a double period: '$text'"
+            Assert ($text -cmatch '^\p{Lu}') "the balloon does not start with a capital letter: '$text'"
+            Assert ($text -cmatch ' \(error \d+\)\. The change applies until MelCat quits\.$') "the balloon does not end with ' (error <code>). The change applies until MelCat quits.': '$text'"
+            Assert (-not $script:Mel.HasExited) 'MelCat exited after failing to save'
+        } finally {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 } catch {
     Write-Host "Smoke test aborted: $($_.Exception.Message) (script line $($_.InvocationInfo.ScriptLineNumber))"
