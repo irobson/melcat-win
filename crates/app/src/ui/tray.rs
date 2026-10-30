@@ -5,7 +5,7 @@ use windows::Win32::Foundation::{ERROR_SUCCESS, HWND};
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_ERROR, NIIF_INFO, NIIF_WARNING,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_WARNING,
     NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICONDATAW, NOTIFYICONDATAW_0, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::SM_CXSMICON;
@@ -19,12 +19,11 @@ use crate::ui::text::fixed_wide;
 pub(crate) const TRAY_ID: u32 = 1;
 const DEFAULT_TOOLTIP: &str = "MelCat";
 
-/// The kind of balloon, which picks the system icon shown in it.
+/// The kind of balloon, which picks the system icon shown in it. MelCat
+/// only ever warns (a setting that could not be saved or applied).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Balloon {
-    Info,
     Warning,
-    Error,
 }
 
 /// Which artwork is current, so the icon is only rebuilt when it changes.
@@ -202,9 +201,7 @@ impl Tray {
         data.szInfoTitle = fixed_wide(title);
         data.szInfo = fixed_wide(text);
         data.dwInfoFlags = match kind {
-            Balloon::Info => NIIF_INFO,
             Balloon::Warning => NIIF_WARNING,
-            Balloon::Error => NIIF_ERROR,
         };
         // SAFETY: fully initialized data for our icon.
         if !unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) }.as_bool() {

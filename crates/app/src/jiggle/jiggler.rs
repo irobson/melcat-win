@@ -270,10 +270,6 @@ impl Jiggler {
         self.status
     }
 
-    pub(crate) fn is_strolling(&self) -> bool {
-        self.stroll.is_some()
-    }
-
     /// Records `status`; returns it if it differs from the last one reported.
     fn set_status(&mut self, status: Status) -> Option<Status> {
         if self.reported && status == self.status {

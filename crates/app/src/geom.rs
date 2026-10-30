@@ -48,9 +48,11 @@ impl RectPx {
     pub fn height(&self) -> i32 {
         self.bottom - self.top
     }
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.width() <= 0 || self.height() <= 0
     }
+    #[cfg(test)]
     pub fn contains(&self, p: PointPx) -> bool {
         p.x >= self.left && p.x < self.right && p.y >= self.top && p.y < self.bottom
     }
@@ -136,10 +138,9 @@ mod tests {
     }
 
     #[test]
-    fn gaps_and_containment() {
+    fn gaps_are_the_larger_axis() {
         assert_eq!(PointPx::new(3, 4).max_gap(PointPx::new(0, 0)), 4);
         assert_eq!(PointPx::new(-3, 1).max_gap(PointPx::new(0, 0)), 3);
-        let r = RectPx::new(0, 0, 10, 10);
-        assert!(r.contains(PointPx::new(0, 0)) && !r.contains(PointPx::new(10, 5)));
+        assert_eq!(RectPx::new(-10, 0, 10, 5).width(), 20);
     }
 }

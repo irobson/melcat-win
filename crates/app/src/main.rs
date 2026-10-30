@@ -16,9 +16,6 @@
 //! actor. No other thread exists.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
-// SKELETON: modules are contracts with `todo!()` bodies until implemented.
-// Remove these two lines once `app.rs` wires everything together.
-#![cfg_attr(windows, allow(dead_code, unused_variables))]
 
 #[cfg(windows)]
 mod app;

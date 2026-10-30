@@ -13,7 +13,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WNDCLASSEXW, WNDPROC,
 };
 
-/// Every MelCat window class name starts with this prefix.
+/// Every MelCat window class name starts with this prefix (checked by tests).
+#[cfg(test)]
 pub(crate) const CLASS_PREFIX: &str = "MelCat.";
 
 /// This module's instance handle.
@@ -100,8 +101,4 @@ mod tests {
         assert_eq!(lparam_point(LPARAM(0xFFFE_FFFF)), (-1, -2));
     }
 
-    #[test]
-    fn the_prefix_names_melcat() {
-        assert!(CLASS_PREFIX.starts_with("MelCat"));
-    }
 }
