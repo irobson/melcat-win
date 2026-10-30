@@ -13,11 +13,14 @@
 //! - Connection: `WTSQuerySessionInformationW(WTSConnectState)` must be
 //!   `WTSActive` (read on demand in [`SessionMonitor::is_away`]).
 //! - Screen saver: `SystemParametersInfoW(SPI_GETSCREENSAVERRUNNING)`, read on demand.
-//! - Displays: `RegisterPowerSettingNotification(main, GUID_CONSOLE_DISPLAY_STATE,
-//!   DEVICE_NOTIFY_WINDOW_HANDLE)`; `WM_POWERBROADCAST` / `PBT_POWERSETTINGCHANGE`
-//!   carries 0 (off), 1 (on) or 2 (dimmed, counts as on). `PBT_APMSUSPEND`
-//!   and `PBT_APMRESUMEAUTOMATIC` also report a change, so a stroll in
-//!   progress is dropped around sleep.
+//! - Displays: `RegisterPowerSettingNotification(main, GUID_SESSION_DISPLAY_STATUS,
+//!   DEVICE_NOTIFY_WINDOW_HANDLE)`: the display of this session, which is
+//!   what an app in an interactive session should watch. A Remote Desktop or
+//!   VM session stays "on" while the physical console's monitor sleeps
+//!   (`GUID_CONSOLE_DISPLAY_STATE`, which MelCat does not use). `WM_POWERBROADCAST`
+//!   / `PBT_POWERSETTINGCHANGE` carries 0 (off), 1 (on) or 2 (dimmed, counts
+//!   as on). `PBT_APMSUSPEND` and `PBT_APMRESUMEAUTOMATIC` also report a
+//!   change, so a stroll in progress is dropped around sleep.
 //!
 //! Both notifications go to `MelCat.Main` (a top-level window).
 //!
@@ -46,7 +49,7 @@ use windows::Win32::System::RemoteDesktop::{
     WTSSessionInfoEx, WTSUnRegisterSessionNotification, NOTIFY_FOR_THIS_SESSION, WTSINFOEXW, WTS_CONNECTSTATE_CLASS,
     WTS_CURRENT_SESSION, WTS_INFO_CLASS, WTS_SESSIONSTATE_LOCK, WTS_SESSIONSTATE_UNLOCK,
 };
-use windows::Win32::System::SystemServices::GUID_CONSOLE_DISPLAY_STATE;
+use windows::Win32::System::SystemServices::GUID_SESSION_DISPLAY_STATUS;
 use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, DEVICE_NOTIFY_WINDOW_HANDLE, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, PBT_POWERSETTINGCHANGE,
     SPI_GETSCREENSAVERRUNNING, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
@@ -56,7 +59,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 /// data length and the value.
 const DISPLAY_SETTING_BYTES: usize = offset_of!(POWERBROADCAST_SETTING, Data) + size_of::<u32>();
 
-/// `GUID_CONSOLE_DISPLAY_STATE` values.
+/// The power setting MelCat watches for the displays: this session's.
+const DISPLAY_SETTING: GUID = GUID_SESSION_DISPLAY_STATUS;
+
+/// `GUID_SESSION_DISPLAY_STATUS` values (a `MONITOR_DISPLAY_STATE`).
 const DISPLAY_OFF: u32 = 0;
 const DISPLAY_ON: u32 = 1;
 const DISPLAY_DIMMED: u32 = 2;
@@ -68,7 +74,7 @@ pub(crate) struct SessionMonitor {
     power: Option<HPOWERNOTIFY>,
     /// From the lock and unlock notifications (and the initial query).
     locked: bool,
-    /// From the console display state notifications.
+    /// From the session display state notifications.
     displays_off: bool,
 }
 
@@ -87,7 +93,7 @@ impl SessionMonitor {
         // SAFETY: as above; the GUID is a static. Windows answers at once with
         // a notification carrying the current display state.
         let power = match unsafe {
-            RegisterPowerSettingNotification(HANDLE(main.0), &GUID_CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_WINDOW_HANDLE)
+            RegisterPowerSettingNotification(HANDLE(main.0), &DISPLAY_SETTING, DEVICE_NOTIFY_WINDOW_HANDLE)
         } {
             Ok(handle) => Some(handle),
             Err(error) => {
@@ -198,7 +204,7 @@ fn displays_off_from(payload: &[u8]) -> Option<bool> {
     // A GUID in memory: Data1, Data2 and Data3 little-endian, then 8 bytes.
     let guid = GUID::from_values(dword(0)?, word(4)?, word(6)?, bytes(8, 8)?.try_into().ok()?);
     let length = dword(offset_of!(POWERBROADCAST_SETTING, DataLength))?;
-    if guid != GUID_CONSOLE_DISPLAY_STATE || length as usize != size_of::<u32>() {
+    if guid != DISPLAY_SETTING || length as usize != size_of::<u32>() {
         return None;
     }
     match dword(offset_of!(POWERBROADCAST_SETTING, Data))? {
@@ -340,8 +346,8 @@ mod tests {
     #[test]
     fn the_payload_layout_matches_the_struct() {
         assert_eq!(DISPLAY_SETTING_BYTES, 24);
-        assert_eq!(payload(GUID_CONSOLE_DISPLAY_STATE, 4, 0).len(), DISPLAY_SETTING_BYTES);
-        let setting = POWERBROADCAST_SETTING { PowerSetting: GUID_CONSOLE_DISPLAY_STATE, DataLength: 4, Data: [7] };
+        assert_eq!(payload(DISPLAY_SETTING, 4, 0).len(), DISPLAY_SETTING_BYTES);
+        let setting = POWERBROADCAST_SETTING { PowerSetting: DISPLAY_SETTING, DataLength: 4, Data: [7] };
         // SAFETY: reading the bytes of a plain struct, within its size.
         let raw = unsafe {
             std::slice::from_raw_parts(
@@ -349,24 +355,37 @@ mod tests {
                 offset_of!(POWERBROADCAST_SETTING, Data),
             )
         };
-        assert_eq!(raw, &payload(GUID_CONSOLE_DISPLAY_STATE, 4, 0)[..20]);
+        assert_eq!(raw, &payload(DISPLAY_SETTING, 4, 0)[..20]);
     }
 
     #[test]
     fn display_states_decode() {
-        assert_eq!(displays_off_from(&payload(GUID_CONSOLE_DISPLAY_STATE, 4, 0)), Some(true));
-        assert_eq!(displays_off_from(&payload(GUID_CONSOLE_DISPLAY_STATE, 4, 1)), Some(false));
-        assert_eq!(displays_off_from(&payload(GUID_CONSOLE_DISPLAY_STATE, 4, 2)), Some(false));
-        assert_eq!(displays_off_from(&payload(GUID_CONSOLE_DISPLAY_STATE, 4, 3)), None);
+        assert_eq!(displays_off_from(&payload(DISPLAY_SETTING, 4, 0)), Some(true));
+        assert_eq!(displays_off_from(&payload(DISPLAY_SETTING, 4, 1)), Some(false));
+        assert_eq!(displays_off_from(&payload(DISPLAY_SETTING, 4, 2)), Some(false));
+        assert_eq!(displays_off_from(&payload(DISPLAY_SETTING, 4, 3)), None);
+    }
+
+    /// The session's display, never the physical console's: a Remote
+    /// Desktop or VM session must not stop when the console monitor sleeps.
+    #[test]
+    fn the_session_display_is_watched_not_the_console() {
+        // GUID_SESSION_DISPLAY_STATUS, {2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5}.
+        assert_eq!(DISPLAY_SETTING, GUID::from_u128(0x2b84c20e_ad23_4ddf_93db_05ffbd7efca5));
+        let console = GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47); // GUID_CONSOLE_DISPLAY_STATE
+        for value in [0, 1, 2] {
+            assert_eq!(displays_off_from(&payload(console, 4, value)), None, "{value}");
+        }
+        assert_eq!(displays_off_from(&payload(DISPLAY_SETTING, 4, 0)), Some(true));
     }
 
     #[test]
     fn other_settings_and_malformed_payloads_are_ignored() {
         let other = GUID::from_u128(0x02731015_4510_4526_99e6_e5a17ebd1aea); // GUID_MONITOR_POWER_ON
         assert_eq!(displays_off_from(&payload(other, 4, 0)), None);
-        assert_eq!(displays_off_from(&payload(GUID_CONSOLE_DISPLAY_STATE, 1, 0)), None);
-        assert_eq!(displays_off_from(&payload(GUID_CONSOLE_DISPLAY_STATE, 8, 0)), None);
-        assert_eq!(displays_off_from(&payload(GUID_CONSOLE_DISPLAY_STATE, 4, 0)[..23]), None);
+        assert_eq!(displays_off_from(&payload(DISPLAY_SETTING, 1, 0)), None);
+        assert_eq!(displays_off_from(&payload(DISPLAY_SETTING, 8, 0)), None);
+        assert_eq!(displays_off_from(&payload(DISPLAY_SETTING, 4, 0)[..23]), None);
         assert_eq!(displays_off_from(&[]), None);
     }
 
@@ -413,7 +432,7 @@ mod tests {
 
     #[test]
     fn this_process_memory_is_readable_and_null_is_not() {
-        let bytes = payload(GUID_CONSOLE_DISPLAY_STATE, 4, 0);
+        let bytes = payload(DISPLAY_SETTING, 4, 0);
         assert!(is_readable(bytes.as_ptr(), bytes.len()));
         assert!(!is_readable(std::ptr::null(), 24));
         assert_eq!(read_display_setting(LPARAM(bytes.as_ptr() as isize)), Some(true));
