@@ -9,14 +9,18 @@
 //! **Tick** ([`Jiggler::tick`], once a second and after any settings change):
 //! 1. `Activity::at(now, mode, schedule, ChronoCalendar<chrono::Local>)` gives
 //!    the [`Status`]: `Off`, `Napping { until }` or `Active { until }`. When
-//!    the status leaves `Active`, a stroll in progress stops at once.
+//!    the status leaves `Active`, a stroll in progress stops at once. It is
+//!    worked out once per minute, mode and schedule ([`ActivityKey`]): every
+//!    change of the schedule's state falls on a whole minute, so the answer
+//!    cannot change within one, and a new time zone shows within a minute.
 //! 2. The idle threshold is drawn with `melcat_core::idle_threshold` whenever
 //!    the interval setting changes and after every finished stroll, minus 1.2 s
 //!    (the tick's period plus its slack), never below 1 s, so a move never
 //!    comes later than the interval the user picked.
 //! 3. While a stroll runs, nothing else happens.
-//! 4. Otherwise `verdict` with: active from step 1; `can_post_events` true;
-//!    `is_session_away` as passed in; `pointer::is_button_down`; and
+//! 4. Otherwise, when step 1 says active, `verdict` with: `is_active` true;
+//!    `can_post_events` true; `is_session_away` from the closure passed in,
+//!    which is called only here, like the macOS app; `pointer::is_button_down`; and
 //!    `min(pointer::seconds_since_last_input, seconds since the last stroll
 //!    ended)` (MelCat's own moves may or may not reset the system idle time;
 //!    the smaller value works either way). `Move` starts a stroll.
@@ -34,10 +38,16 @@
 //! time elapsed since the stroll began (`elapsed / JiggleWalk::STEP_INTERVAL`),
 //! not by counting timer messages, so a late timer skips points instead of
 //! stretching the stroll. Before each move:
+//! - if the pointer is still exactly on the stroll's start pixel although
+//!   MelCat has posted two other pixels since, the moves did not land (UIPI
+//!   drops them over an elevated window, see `pointer`): stop as
+//!   `the pointer could not be moved`, keep the anchor, and count it as the
+//!   stroll's end, so the next try comes after a whole threshold;
 //! - if the pointer is more than [`TAKEOVER_PX`] from both of the last two
-//!   pixels MelCat posted, a hand moved it: stop, and forget the anchor;
-//! - if a mouse button is down, or [`Jiggler::note_personal_input`] was called
-//!   since the stroll began (a key, a button or the wheel): stop, keep the anchor;
+//!   pixels MelCat posted, or a mouse button is down, a hand is on the mouse:
+//!   stop, and forget the anchor;
+//! - if [`Jiggler::note_personal_input`] was called since the stroll began (a
+//!   key press, a modifier, a button press or the wheel): stop, keep the anchor;
 //! - otherwise move to the step's pixel (`pointer::move_to`), skipped when it
 //!   is the pixel MelCat posted last.
 //!   After the last point the stroll ends; the end time is remembered and a new
@@ -55,6 +65,7 @@
 //! - `stroll started: <n> steps from <x>,<y> to <tx>,<ty>` (pixels);
 //! - `stroll finished at <x>,<y>`;
 //! - `stroll stopped: pointer moved`, `stroll stopped: input`,
+//!   `stroll stopped: the pointer could not be moved`,
 //!   `stroll stopped: <interrupt reason>`.
 //!
 //! Cases the list above leaves open, decided here:
@@ -64,14 +75,15 @@
 //!   `stroll stopped: status changed`, keeping the anchor.
 //! - A move that `SendInput` refuses stops the stroll
 //!   (`stroll stopped: the pointer could not be moved`) and counts as its
-//!   end, so MelCat tries again after a whole threshold, not every second.
+//!   end, so MelCat tries again after a whole threshold, not every second,
+//!   exactly like moves that never land.
 
 use std::hash::{BuildHasher, RandomState};
 use std::time::{Instant as Clock, SystemTime, UNIX_EPOCH};
 
 use melcat_core::{
-    idle_threshold, plan_walk, verdict, Activity, ChronoCalendar, Instant, Intensity, JiggleConditions, JiggleVerdict,
-    JiggleWalk, RandomSource, SplitMix64,
+    idle_threshold, plan_walk, verdict, Activity, ChronoCalendar, Instant, Intensity, JiggleConditions, JiggleMode,
+    JiggleVerdict, JiggleWalk, RandomSource, Schedule, SplitMix64,
 };
 use windows::Win32::Foundation::{GetLastError, HWND};
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
@@ -122,6 +134,8 @@ struct Stroll {
     /// The planned positions, in physical pixels, one per `STEP_INTERVAL`.
     /// Never empty.
     pixels: Vec<PointPx>,
+    /// Where the pointer was when the stroll began.
+    from: PointPx,
     started: Clock,
     /// A key, a button or the wheel was used since the stroll began.
     input_seen: bool,
@@ -145,6 +159,8 @@ pub(crate) struct Jiggler {
     threshold: f64,
     /// The interval `threshold` was drawn for; another one redraws it.
     threshold_interval: Option<f64>,
+    /// The last `Activity::at` answer and what it was asked for.
+    activity: Option<(ActivityKey, Activity)>,
     rng: SplitMix64,
 }
 
@@ -162,14 +178,18 @@ impl Jiggler {
             last_stroll_ended: None,
             threshold: 0.0,
             threshold_interval: None,
+            activity: None,
             rng: SplitMix64::new(seed()),
         }
     }
 
     /// The once-a-second check. Returns the new status when it changed.
-    pub(crate) fn tick(&mut self, settings: &Settings, session_away: bool) -> Option<Status> {
-        let activity =
-            Activity::at(paths::now(), settings.mode, &settings.schedule, &ChronoCalendar::new(chrono::Local));
+    /// `session_away` is called only when a stroll could start.
+    pub(crate) fn tick(&mut self, settings: &Settings, session_away: impl FnOnce() -> bool) -> Option<Status> {
+        let now = paths::now();
+        let activity = cached_activity(&mut self.activity, activity_key(now, settings), || {
+            Activity::at(now, settings.mode, &settings.schedule, &ChronoCalendar::new(chrono::Local))
+        });
         let changed = self.set_status(status_of(activity));
 
         if self.threshold_interval != Some(settings.idle_interval) {
@@ -184,7 +204,7 @@ impl Jiggler {
             let conditions = JiggleConditions {
                 is_active: true,
                 can_post_events: true,
-                is_session_away: session_away,
+                is_session_away: session_away(),
                 is_mouse_button_down: pointer::is_button_down(),
                 seconds_since_last_input: idle_for_decision(pointer::seconds_since_last_input(), since_stroll),
                 idle_threshold: self.threshold,
@@ -207,11 +227,17 @@ impl Jiggler {
 
         match check_step(
             pointer::cursor_pos(),
+            stroll.from,
             self.last_posted,
             self.previous_posted,
             pointer::is_button_down(),
             input_seen,
         ) {
+            StepCheck::Stuck => {
+                // The moves do not land: wait a whole threshold, keep the anchor.
+                self.cannot_move();
+                return;
+            }
             StepCheck::PointerMoved => {
                 // A hand took the mouse: let go, and wander around wherever
                 // it leaves the pointer next time.
@@ -229,8 +255,7 @@ impl Jiggler {
 
         if self.last_posted != Some(pixel) {
             if !pointer::move_to(pixel) {
-                self.stop("the pointer could not be moved");
-                self.last_stroll_ended = Some(Clock::now());
+                self.cannot_move();
                 return;
             }
             self.previous_posted = self.last_posted;
@@ -245,7 +270,8 @@ impl Jiggler {
         }
     }
 
-    /// A key, a mouse button or the wheel was used (from `watch::is_personal_input`).
+    /// A key, a modifier, a mouse button or the wheel was pressed (from
+    /// `watch::is_personal_input`).
     pub(crate) fn note_personal_input(&mut self) {
         if let Some(stroll) = &mut self.stroll {
             stroll.input_seen = true;
@@ -316,7 +342,14 @@ impl Jiggler {
         crate::log_info!("{}", started_line(pixels.len(), current, target));
         self.last_posted = Some(current);
         self.previous_posted = None;
-        self.stroll = Some(Stroll { pixels, started: Clock::now(), input_seen: false });
+        self.stroll = Some(Stroll { pixels, from: current, started: Clock::now(), input_seen: false });
+    }
+
+    /// The pointer cannot be moved: stop, keep the anchor, and count it as
+    /// the stroll's end, so the next try waits a whole threshold.
+    fn cannot_move(&mut self) {
+        self.stop("the pointer could not be moved");
+        self.last_stroll_ended = Some(Clock::now());
     }
 
     /// Ends the stroll in progress, if any, and logs why.
@@ -358,6 +391,37 @@ fn status_of(activity: Activity) -> Status {
     }
 }
 
+/// What `Activity::at` is asked with, besides the calendar: the minute (every
+/// change of the schedule's state falls on a whole minute), the mode and the
+/// schedule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ActivityKey {
+    minute: i64,
+    mode: JiggleMode,
+    schedule: Schedule,
+}
+
+fn activity_key(now: Instant, settings: &Settings) -> ActivityKey {
+    ActivityKey { minute: now.0.div_euclid(60), mode: settings.mode, schedule: settings.schedule }
+}
+
+/// The activity cached for `key`, or a fresh one from `work_out` (kept for
+/// next time) when there is none or the key changed.
+fn cached_activity(
+    cache: &mut Option<(ActivityKey, Activity)>,
+    key: ActivityKey,
+    work_out: impl FnOnce() -> Activity,
+) -> Activity {
+    match *cache {
+        Some((cached, activity)) if cached == key => activity,
+        _ => {
+            let activity = work_out();
+            *cache = Some((key, activity));
+            activity
+        }
+    }
+}
+
 /// A drawn threshold minus the tick's period and slack, never below one second.
 fn threshold_after_slack(drawn: f64) -> f64 {
     (drawn - THRESHOLD_SLACK).max(SHORTEST_THRESHOLD)
@@ -384,33 +448,51 @@ fn needs_new_anchor(current: PointPx, anchor: Option<PointPx>, last_posted: Opti
 /// What a stroll step does before it moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StepCheck {
-    /// The pointer is far from both of the last two posted pixels: a hand moved it.
+    /// The pointer never left the start pixel although two other pixels were
+    /// posted: the moves do not land.
+    Stuck,
+    /// The pointer is far from both of the last two posted pixels, or a
+    /// button is held: a hand is on the mouse.
     PointerMoved,
-    /// A button is held, or a key, a button or the wheel was used.
+    /// A key, a modifier, a button or the wheel was pressed.
     Input,
     /// Carry on.
     Go,
 }
 
-/// The checks before each step, in order. The position check needs both the
+/// The checks before each step, in order. The position checks need both the
 /// pointer (unknown when another desktop has the input) and a posted pixel;
 /// comparing with the last two absorbs one step of lag in `SendInput`.
 fn check_step(
     current: Option<PointPx>,
+    from: PointPx,
     last_posted: Option<PointPx>,
     previous_posted: Option<PointPx>,
     button_down: bool,
     input_seen: bool,
 ) -> StepCheck {
     if let (Some(current), Some(last)) = (current, last_posted) {
+        if never_left(current, from, last, previous_posted) {
+            return StepCheck::Stuck;
+        }
         if far_from_all(current, std::iter::once(last).chain(previous_posted)) {
             return StepCheck::PointerMoved;
         }
     }
-    if button_down || input_seen {
+    if button_down {
+        return StepCheck::PointerMoved;
+    }
+    if input_seen {
         return StepCheck::Input;
     }
     StepCheck::Go
+}
+
+/// Whether the pointer is still exactly on `from`, the stroll's start pixel,
+/// although the last two pixels posted (two distinct ones) are both other
+/// than it: two moves in a row did not land.
+fn never_left(current: PointPx, from: PointPx, last: PointPx, previous: Option<PointPx>) -> bool {
+    current == from && last != from && previous.is_some_and(|previous| previous != from)
 }
 
 /// The step to show `elapsed` seconds into a stroll of `steps` positions:
@@ -459,7 +541,7 @@ fn stopped_line(reason: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use melcat_core::{idle_threshold, SplitMix64};
+    use melcat_core::{idle_threshold, SplitMix64, TimeOfDay};
 
     use super::*;
     use crate::geom::RectPx;
@@ -514,29 +596,115 @@ mod tests {
 
     #[test]
     fn a_hand_on_the_mouse_is_noticed_against_the_last_two_pixels() {
+        let from = PointPx::new(13, 11);
         let last = Some(PointPx::new(10, 10));
         let previous = Some(PointPx::new(13, 10));
         let at = |x, y| Some(PointPx::new(x, y));
-        assert_eq!(check_step(at(10, 10), last, previous, false, false), StepCheck::Go);
-        assert_eq!(check_step(at(11, 9), last, previous, false, false), StepCheck::Go);
+        assert_eq!(check_step(at(10, 10), from, last, previous, false, false), StepCheck::Go);
+        assert_eq!(check_step(at(11, 9), from, last, previous, false, false), StepCheck::Go);
         // Still on the previous pixel: the last move has not landed yet.
-        assert_eq!(check_step(at(13, 10), last, previous, false, false), StepCheck::Go);
-        assert_eq!(check_step(at(10, 12), last, previous, false, false), StepCheck::PointerMoved);
-        assert_eq!(check_step(at(16, 10), last, previous, false, false), StepCheck::PointerMoved);
-        assert_eq!(check_step(at(12, 10), last, None, false, false), StepCheck::PointerMoved);
+        assert_eq!(check_step(at(13, 10), from, last, previous, false, false), StepCheck::Go);
+        assert_eq!(check_step(at(10, 12), from, last, previous, false, false), StepCheck::PointerMoved);
+        assert_eq!(check_step(at(16, 10), from, last, previous, false, false), StepCheck::PointerMoved);
+        assert_eq!(check_step(at(12, 10), from, last, None, false, false), StepCheck::PointerMoved);
         // The position check comes first, so a drag forgets the anchor.
-        assert_eq!(check_step(at(40, 40), last, previous, true, true), StepCheck::PointerMoved);
+        assert_eq!(check_step(at(40, 40), from, last, previous, true, true), StepCheck::PointerMoved);
+    }
+
+    /// As on macOS: a button held during a stroll is a hand on the mouse, even
+    /// with the pointer still on MelCat's path, so the anchor is forgotten.
+    #[test]
+    fn a_held_button_is_a_hand_on_the_mouse() {
+        let from = PointPx::new(9, 10);
+        let last = Some(PointPx::new(10, 10));
+        assert_eq!(check_step(last, from, last, None, true, false), StepCheck::PointerMoved);
+        assert_eq!(check_step(last, from, last, None, true, true), StepCheck::PointerMoved);
+        assert_eq!(check_step(None, from, last, None, true, false), StepCheck::PointerMoved);
+        assert_eq!(check_step(None, from, None, None, true, false), StepCheck::PointerMoved);
     }
 
     #[test]
-    fn keys_buttons_and_the_wheel_stop_a_stroll_on_its_path() {
+    fn keys_button_presses_and_the_wheel_stop_a_stroll_on_its_path() {
+        let from = PointPx::new(9, 10);
         let last = Some(PointPx::new(10, 10));
-        assert_eq!(check_step(last, last, None, true, false), StepCheck::Input);
-        assert_eq!(check_step(last, last, None, false, true), StepCheck::Input);
-        // An unknown pointer or nothing posted yet skips only the position check.
-        assert_eq!(check_step(None, last, None, false, false), StepCheck::Go);
-        assert_eq!(check_step(None, last, None, false, true), StepCheck::Input);
-        assert_eq!(check_step(Some(PointPx::new(90, 90)), None, None, false, false), StepCheck::Go);
+        assert_eq!(check_step(last, from, last, None, false, true), StepCheck::Input);
+        // An unknown pointer or nothing posted yet skips only the position checks.
+        assert_eq!(check_step(None, from, last, None, false, false), StepCheck::Go);
+        assert_eq!(check_step(None, from, last, None, false, true), StepCheck::Input);
+        assert_eq!(check_step(Some(PointPx::new(90, 90)), from, None, None, false, false), StepCheck::Go);
+    }
+
+    /// UIPI drops the moves over an elevated window: the pointer stays on the
+    /// start pixel while MelCat posts the path.
+    #[test]
+    fn moves_that_never_land_are_noticed() {
+        let from = PointPx::new(100, 100);
+        let (p1, p2, p3) = (PointPx::new(101, 100), PointPx::new(102, 101), PointPx::new(103, 101));
+        let still = Some(from);
+        // Before the first move and after one, the pointer may well be there yet.
+        assert_eq!(check_step(still, from, Some(from), None, false, false), StepCheck::Go);
+        assert_eq!(check_step(still, from, Some(p1), Some(from), false, false), StepCheck::Go);
+        // Two pixels other than the start posted, and it never left.
+        assert_eq!(check_step(still, from, Some(p2), Some(p1), false, false), StepCheck::Stuck);
+        assert_eq!(check_step(still, from, Some(p3), Some(p2), false, false), StepCheck::Stuck);
+        // Whatever else happens, the moves do not land.
+        assert_eq!(check_step(still, from, Some(p2), Some(p1), true, true), StepCheck::Stuck);
+        // On the path a step behind, or a path that comes back over the start.
+        assert_eq!(check_step(Some(p1), from, Some(p2), Some(p1), false, false), StepCheck::Go);
+        assert_eq!(check_step(still, from, Some(from), Some(p1), false, false), StepCheck::Go);
+        // A pixel off the start is not "never left": a hand nudged it.
+        let nudged = Some(PointPx::new(99, 100));
+        assert_eq!(check_step(nudged, from, Some(p3), Some(p2), false, false), StepCheck::PointerMoved);
+        // An unknown pointer says nothing.
+        assert_eq!(check_step(None, from, Some(p3), Some(p2), false, false), StepCheck::Go);
+    }
+
+    /// Asks `cache` at `now` with `settings`; true when the activity had to be
+    /// worked out again.
+    fn worked_out(cache: &mut Option<(ActivityKey, Activity)>, now: i64, settings: &Settings) -> bool {
+        let mut ran = false;
+        cached_activity(cache, activity_key(Instant(now), settings), || {
+            ran = true;
+            Activity::Active { until: None }
+        });
+        ran
+    }
+
+    #[test]
+    fn the_activity_is_worked_out_once_a_minute_per_mode_and_schedule() {
+        let settings = Settings::default();
+        let minute = 1_800_000_000 / 60 * 60;
+        let mut cache = None;
+        assert!(worked_out(&mut cache, minute, &settings));
+        assert!(!worked_out(&mut cache, minute + 1, &settings));
+        assert!(!worked_out(&mut cache, minute + 59, &settings));
+        assert!(worked_out(&mut cache, minute + 60, &settings));
+        // The clock set back.
+        assert!(worked_out(&mut cache, minute - 1, &settings));
+        assert!(!worked_out(&mut cache, minute - 60, &settings));
+        // What the schedule does not depend on changes nothing.
+        let moved = Settings { intensity: Intensity::Playful, idle_interval: 5.0, ..settings };
+        assert!(!worked_out(&mut cache, minute - 30, &moved));
+        // Another mode or schedule is worked out at once.
+        assert!(worked_out(&mut cache, minute - 30, &Settings { mode: JiggleMode::Always, ..settings }));
+        assert!(worked_out(&mut cache, minute - 30, &settings));
+        let later = Schedule { end: TimeOfDay::at(19, 0), ..settings.schedule };
+        assert!(worked_out(&mut cache, minute - 30, &Settings { schedule: later, ..settings }));
+        // The answer comes from the cache while the key holds.
+        let key = activity_key(Instant(minute - 30), &Settings { schedule: later, ..settings });
+        assert_eq!(cached_activity(&mut cache, key, || Activity::Off), Activity::Active { until: None });
+    }
+
+    #[test]
+    fn minutes_start_on_whole_minutes_before_1970_too() {
+        let settings = Settings::default();
+        let minute = |now| activity_key(Instant(now), &settings).minute;
+        assert_eq!(minute(0), 0);
+        assert_eq!(minute(59), 0);
+        assert_eq!(minute(60), 1);
+        assert_eq!(minute(-1), -1);
+        assert_eq!(minute(-60), -1);
+        assert_eq!(minute(-61), -2);
     }
 
     #[test]

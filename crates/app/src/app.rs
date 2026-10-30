@@ -25,7 +25,8 @@
 //!    `IsDialogMessageW` first, until Quit. Returns the exit code.
 //!
 //! Messages:
-//! - `TICK_TIMER`: `jiggler.tick(&settings, session.is_away())`; on a status
+//! - `TICK_TIMER`: `jiggler.tick(&settings, || session.is_away())` (the
+//!   jiggler asks only when a stroll could start); on a status
 //!   change, update the tray: `tray.set_active(status.is_active())` and the
 //!   tooltip `MelCat: <status line>` (`ui::text::status_line`). The tooltip
 //!   is also refreshed once a minute, so "tomorrow" and "today" stay right.
@@ -731,7 +732,7 @@ impl Controller {
     /// The once-a-second check, also run after any settings change.
     fn tick(&mut self) {
         let settings = self.current();
-        let changed = self.jiggler.tick(&settings, session_is_away()).is_some();
+        let changed = self.jiggler.tick(&settings, session_is_away).is_some();
         let now = paths::now();
         if changed || tip_is_stale(self.tip_minute, now) {
             self.show_status(now);
