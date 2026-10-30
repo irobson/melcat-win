@@ -137,7 +137,7 @@ struct Stroll {
     /// Where the pointer was when the stroll began.
     from: PointPx,
     started: Clock,
-    /// A key, a button or the wheel was used since the stroll began.
+    /// A key, a modifier, a button or the wheel was pressed since the stroll began.
     input_seen: bool,
 }
 
