@@ -2,8 +2,13 @@ name: Release
 
 # Push a tag like v0.1.0 to build MelCat.exe on Windows and publish it as a
 # GitHub Release. The tag must match the workspace version in Cargo.toml.
-# Run it manually (Actions > Release > Run workflow) for a dry run that builds
-# and packages without publishing anything.
+# The exe that is published first passes scripts/smoke-test.ps1 on the
+# runner's desktop; its 'exe' step also checks that the version info in
+# crates/app/resources/app.rc and the manifest's version in app.manifest are
+# that version, so bump all three together.
+# Run it manually (Actions > Release > Run workflow) for a dry run that builds,
+# smoke-tests and packages without publishing anything, even from a tag:
+# only a pushed tag publishes.
 
 on:
   push:
@@ -51,6 +56,21 @@ jobs:
       - name: Build release
         run: cargo build --release -p melcat
 
+      # The exe that is published, end to end on the runner's desktop. A
+      # failure stops the job before anything is packaged or published.
+      - name: Smoke test
+        shell: powershell
+        run: .\scripts\smoke-test.ps1 -Exe target\release\MelCat.exe -ArtifactsDir smoke-artifacts
+
+      - name: Upload smoke artifacts (log, desktop screenshots, summary)
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: smoke-${{ github.sha }}
+          path: smoke-artifacts
+          retention-days: 14
+          if-no-files-found: warn
+
       - name: Package
         shell: pwsh
         run: |
@@ -73,7 +93,8 @@ jobs:
           retention-days: 30
 
       - name: Publish GitHub Release
-        if: github.ref_type == 'tag'
+        # Only a pushed tag publishes; a manual run is a dry run even from a tag.
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -86,6 +107,6 @@ jobs:
 
           Windows SmartScreen may warn that the app is unrecognized, because it is not code-signed yet: click **More info**, then **Run anyway**. The `.zip` holds the same exe with the README and the license, and `SHA256SUMS.txt` lists the checksums.
 
-          Requires Windows 10 or 11, x64 (runs on ARM64 Windows through emulation).
+          Requires Windows 10 version 1607 or later, or Windows 11, x64 (runs on ARM64 Windows through emulation).
           "@
           gh release create $tag dist/* --title "MelCat $tag" --notes $notes --generate-notes --verify-tag

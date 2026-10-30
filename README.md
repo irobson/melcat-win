@@ -12,6 +12,10 @@ A gentle, scheduled mouse jiggler for the Windows system tray, written in native
 
 Work in progress: the first release is being built. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Requirements
+
+Windows 10 version 1607 or later, or Windows 11, x64 (runs on ARM64 Windows through emulation). MelCat uses the per-monitor DPI functions that Windows 10 gained in version 1607.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
