@@ -32,7 +32,8 @@ pub(crate) fn approved_disables(data: &[u8]) -> bool {
 }
 
 fn current_exe() -> Result<std::path::PathBuf, String> {
-    std::env::current_exe().map_err(|error| format!("could not find MelCat.exe: {error}"))
+    std::env::current_exe()
+        .map_err(|error| format!("could not find MelCat.exe: {}", crate::messages::io_error_text(&error)))
 }
 
 fn read_run_value() -> Option<String> {

@@ -168,6 +168,24 @@ pub fn sanitize_interval(seconds: f64) -> f64 {
     }
 }
 
+/// Why [`Settings::read_from`] gave no settings. Displays as the reason, for the log.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReadError {
+    /// The file is there but could not be read, for example while another
+    /// program holds it: worth trying again.
+    Unreadable(String),
+    /// The file is not a JSON object: trying again gives the same answer.
+    NotJson(String),
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReadError::Unreadable(reason) | ReadError::NotJson(reason) => f.write_str(reason),
+        }
+    }
+}
+
 impl Settings {
     /// `%APPDATA%\MelCat\settings.json`.
     pub fn path() -> PathBuf {
@@ -193,15 +211,15 @@ impl Settings {
 
     /// Reads `path`: `Ok(None)` when it does not exist, `Err` with the reason
     /// (for the log) when it cannot be read or is not a JSON object.
-    pub fn read_from(path: &Path) -> Result<Option<Settings>, String> {
+    pub fn read_from(path: &Path) -> Result<Option<Settings>, ReadError> {
         let bytes = match fs::read(path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+            Err(error) => return Err(ReadError::Unreadable(format!("could not read {}: {error}", path.display()))),
         };
         match Self::parse(&decode(&bytes)) {
             Some(settings) => Ok(Some(settings)),
-            None => Err(format!("{} is not a JSON object", path.display())),
+            None => Err(ReadError::NotJson(format!("{} is not a JSON object", path.display()))),
         }
     }
 
@@ -395,7 +413,8 @@ mod tests {
         fs::write(&garbage, "not json").expect("written");
         assert_eq!(Settings::load_from(&garbage), Settings::default());
         let reason = Settings::read_from(&garbage).expect_err("not a JSON object");
-        assert!(reason.ends_with("garbage.json is not a JSON object"), "{reason}");
+        assert!(matches!(reason, ReadError::NotJson(_)), "{reason:?}");
+        assert!(reason.to_string().ends_with("garbage.json is not a JSON object"), "{reason}");
         assert_eq!(Settings::read_from(&dir.join("missing.json")), Ok(None));
         let _ = fs::remove_dir_all(&dir);
     }

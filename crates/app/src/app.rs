@@ -123,7 +123,7 @@ use crate::messages::{
     io_error_text, sentence, TICK_MILLIS, TICK_TIMER, TRAY_RETRY_TIMER, WALK_TIMER, WM_APP_PREVIEW,
     WM_APP_SETTINGS_CHANGED, WM_APP_SETTINGS_CLOSED, WM_APP_TRAY,
 };
-use crate::settings::{sanitize_interval, Settings};
+use crate::settings::{sanitize_interval, ReadError, Settings};
 use crate::ui::menu_model::{build_menu, Command, MenuEntry, MenuState};
 use crate::ui::settings_window::SettingsWindow;
 use crate::ui::tray::{Balloon, Tray};
@@ -278,6 +278,7 @@ fn run_app() -> i32 {
         msg,
         settings: Rc::new(RefCell::new(settings)),
         settings_stamp,
+        reload_warned: false,
         jiggler: Jiggler::new(msg),
         tray: Tray::new(main),
         tray_retrying: false,
@@ -660,6 +661,8 @@ struct Controller {
     /// `settings.json`'s stamp when MelCat last read or saved it; another one
     /// means someone else wrote the file.
     settings_stamp: Option<(SystemTime, u64)>,
+    /// An unreadable `settings.json` was already reported; reset by a good read.
+    reload_warned: bool,
     jiggler: Jiggler,
     tray: Tray,
     /// True while `TRAY_RETRY_TIMER` runs.
@@ -765,9 +768,10 @@ impl Controller {
             return false;
         }
         // Noted before reading, so a write that lands meanwhile is read next time.
-        self.settings_stamp = stamp;
+        let previous = std::mem::replace(&mut self.settings_stamp, stamp);
         match Settings::read_from(&path) {
             Ok(Some(settings)) => {
+                self.reload_warned = false;
                 crate::log_info!("settings reloaded: {settings:?}");
                 *self.settings.borrow_mut() = settings;
                 self.refresh_settings_window();
@@ -775,6 +779,16 @@ impl Controller {
             }
             // Removed: the settings in force stay, and the next change writes the file again.
             Ok(None) => false,
+            // Another program may hold the file while it writes it: forget the
+            // stamp so the next tick reads it again, and warn only once.
+            Err(ReadError::Unreadable(reason)) => {
+                self.settings_stamp = previous;
+                if !self.reload_warned {
+                    self.reload_warned = true;
+                    crate::log_warn!("{reason}; keeping the current settings and trying again");
+                }
+                false
+            }
             Err(reason) => {
                 crate::log_warn!("{reason}; keeping the current settings");
                 false

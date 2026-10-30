@@ -38,11 +38,6 @@
 //! time elapsed since the stroll began (`elapsed / JiggleWalk::STEP_INTERVAL`),
 //! not by counting timer messages, so a late timer skips points instead of
 //! stretching the stroll. Before each move:
-//! - if the pointer is still exactly on the stroll's start pixel although
-//!   MelCat has posted two other pixels since, the moves did not land (UIPI
-//!   drops them over an elevated window, see `pointer`): stop as
-//!   `the pointer could not be moved`, keep the anchor, and count it as the
-//!   stroll's end, so the next try comes after a whole threshold;
 //! - if the pointer is more than [`TAKEOVER_PX`] from both of the last two
 //!   pixels MelCat posted, or a mouse button is down, a hand is on the mouse:
 //!   stop, and forget the anchor;
@@ -75,8 +70,13 @@
 //!   `stroll stopped: status changed`, keeping the anchor.
 //! - A move that `SendInput` refuses stops the stroll
 //!   (`stroll stopped: the pointer could not be moved`) and counts as its
-//!   end, so MelCat tries again after a whole threshold, not every second,
-//!   exactly like moves that never land.
+//!   end, so MelCat tries again after a whole threshold, not every second.
+//! - Moves that never land (Windows only: UIPI drops them over an elevated
+//!   window, see `pointer`): checked before everything else on each step. If
+//!   the pointer is still exactly on the stroll's start pixel although MelCat
+//!   has posted two other pixels since, the stroll stops the same way
+//!   (`the pointer could not be moved`), keeps the anchor, and the start
+//!   pixel counts as where MelCat last put the pointer.
 
 use std::hash::{BuildHasher, RandomState};
 use std::time::{Instant as Clock, SystemTime, UNIX_EPOCH};
@@ -234,7 +234,11 @@ impl Jiggler {
             input_seen,
         ) {
             StepCheck::Stuck => {
-                // The moves do not land: wait a whole threshold, keep the anchor.
+                // The moves do not land: wait a whole threshold, keep the
+                // anchor. The pointer is still on the start pixel, so that is
+                // where MelCat last put it, not the pixels that never landed.
+                self.last_posted = Some(stroll.from);
+                self.previous_posted = None;
                 self.cannot_move();
                 return;
             }
