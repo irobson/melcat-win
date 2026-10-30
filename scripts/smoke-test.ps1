@@ -62,7 +62,8 @@
                     RDW_UPDATENOW) gives: none keeps pixels drawn in the old
                     font. The window is made topmost first. (WM_DPICHANGED
                     takes the same path, but Windows refuses to send it from
-                    another process.)
+                    another process. A guard: on this Windows the window's own
+                    resize already repaints every control.)
       settings-short-time
                     With the long time format 'h:mm:ss tt', the short one
                     'HH:mm tt' and the markers 'a.m.'/'p.m.' (SetLocaleInfoW,

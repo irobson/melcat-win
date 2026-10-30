@@ -20,7 +20,8 @@
 //!  | Movement
 //!  |   Distance   [Gentle · up to 5 pt v]
 //!  |   ...
-//!  |   [Preview]  <note>
+//!  |   Try the movement now  [Preview]
+//!  |   <preview note, the full width>
 //!  |   <movement footer, the full width>
 //!  | General
 //!  |   [x] Launch at login
@@ -141,8 +142,7 @@ pub(super) fn layout(scale: f64, measure: Measure<'_>, texts: &Texts) -> Layout 
     // Columns.
     let header_x = s(MARGIN);
     let label_x = header_x + s(INDENT);
-    let preview_w = button(Part::Preview.title());
-    let label_w = widest(Part::LABELS.iter().map(|part| width_of(Face::Body, part.title())).chain([preview_w]));
+    let label_w = widest(Part::LABELS.iter().map(|part| width_of(Face::Body, part.title())));
     let mode_label_w = width_of(Face::Header, Part::ModeLabel.title());
     let control_x = (label_x + label_w).max(header_x + mode_label_w) + s(COLUMN_GAP);
 
@@ -203,12 +203,14 @@ pub(super) fn layout(scale: f64, measure: Measure<'_>, texts: &Texts) -> Layout 
     parts.push((Part::IntervalLabel, rect(label_x, y, label_w, row)));
     parts.push((Part::Interval, rect(control_x, y, combo_w, row)));
     y += row + s(ROW_GAP);
-    // The note sits beside the button, both centered on the taller of the two.
-    let note_h = wrapped(PREVIEW_NOTE, control_w);
-    let preview_row = row.max(note_h);
-    parts.push((Part::Preview, rect(label_x, y + (preview_row - row) / 2, preview_w, row)));
-    parts.push((Part::PreviewNote, rect(control_x, y + (preview_row - note_h) / 2, control_w, note_h)));
-    y += preview_row + s(TEXT_GAP);
+    // As on macOS: "Try the movement now" names the button, and the note
+    // goes under that label.
+    parts.push((Part::PreviewLabel, rect(label_x, y, label_w, row)));
+    parts.push((Part::Preview, rect(control_x, y, button(Part::Preview.title()), row)));
+    y += row + s(TEXT_GAP);
+    let note_h = wrapped(PREVIEW_NOTE, full_w);
+    parts.push((Part::PreviewNote, rect(label_x, y, full_w, note_h)));
+    y += note_h + s(ROW_GAP);
     let footer_h = wrapped(MOVEMENT_FOOTER, full_w);
     parts.push((Part::MovementFooter, rect(label_x, y, full_w, footer_h)));
     y += footer_h + s(SECTION_GAP);
@@ -270,31 +272,34 @@ mod tests {
     #[test]
     fn the_page_at_100_percent() {
         let layout = at(1.0);
-        // The label column is as wide as "Move after idle" (15 glyphs, 90 px;
-        // the Preview button is 88), so controls start at 28 + 90 + 16.
-        let interval_label = layout.rect(Part::IntervalLabel);
-        assert_eq!((interval_label.left, interval_label.right, interval_label.height()), (28, 118, 24));
-        assert_eq!(layout.rect(Part::ModeLabel), RectPx::new(16, 12, 118, 36));
+        // The label column is as wide as "Try the movement now" (20 glyphs,
+        // 120 px), so controls start at 28 + 120 + 16.
+        let preview_label = layout.rect(Part::PreviewLabel);
+        assert_eq!((preview_label.left, preview_label.right, preview_label.height()), (28, 148, 24));
+        assert_eq!(layout.rect(Part::ModeLabel), RectPx::new(16, 12, 148, 36));
         // The widest row, the days (7 x (3 glyphs + 22) + 6 x 2 = 292), is
         // under the minimum, so the control column is 320 wide.
-        assert_eq!(layout.width, 134 + 320 + 16);
-        assert_eq!(layout.rect(Part::Mode(0)), RectPx::new(134, 12, 134 + 66 + 22, 36));
-        assert_eq!(layout.rect(Part::Mode(1)).left, 134 + 88 + 12);
+        assert_eq!(layout.width, 164 + 320 + 16);
+        assert_eq!(layout.rect(Part::Mode(0)), RectPx::new(164, 12, 164 + 66 + 22, 36));
+        assert_eq!(layout.rect(Part::Mode(1)).left, 164 + 88 + 12);
         // The longest mode footer (59 glyphs, 354 px) wraps to two lines.
-        assert_eq!(layout.rect(Part::ModeFooter), RectPx::new(134, 40, 454, 72));
-        assert_eq!(layout.rect(Part::ScheduleHeader), RectPx::new(16, 88, 454, 104));
-        assert_eq!(layout.rect(Part::Day(0)), RectPx::new(134, 110, 174, 134));
-        assert_eq!(layout.rect(Part::Day(6)), RectPx::new(134 + 6 * 42, 110, 134 + 6 * 42 + 40, 134));
-        assert_eq!(layout.rect(Part::From), RectPx::new(134, 140, 134 + 112, 164));
-        assert_eq!(layout.rect(Part::To), RectPx::new(134, 170, 134 + 112, 194));
+        assert_eq!(layout.rect(Part::ModeFooter), RectPx::new(164, 40, 484, 72));
+        assert_eq!(layout.rect(Part::ScheduleHeader), RectPx::new(16, 88, 484, 104));
+        assert_eq!(layout.rect(Part::Day(0)), RectPx::new(164, 110, 204, 134));
+        assert_eq!(layout.rect(Part::Day(6)), RectPx::new(164 + 6 * 42, 110, 164 + 6 * 42 + 40, 134));
+        assert_eq!(layout.rect(Part::From), RectPx::new(164, 140, 164 + 112, 164));
+        assert_eq!(layout.rect(Part::To), RectPx::new(164, 170, 164 + 112, 194));
         // The "all day" hint (57 glyphs) needs two lines, so two are reserved.
-        assert_eq!(layout.rect(Part::Hint), RectPx::new(134, 198, 454, 230));
-        assert_eq!(layout.rect(Part::Distance), RectPx::new(134, 268, 134 + 208, 292));
-        assert_eq!(layout.rect(Part::Preview), RectPx::new(28, 328, 28 + 88, 352));
-        // The one-line note is centered on the button.
-        assert_eq!(layout.rect(Part::PreviewNote), RectPx::new(134, 332, 454, 348));
+        assert_eq!(layout.rect(Part::Hint), RectPx::new(164, 198, 484, 230));
+        assert_eq!(layout.rect(Part::Distance), RectPx::new(164, 268, 164 + 208, 292));
+        assert_eq!(layout.rect(Part::Interval), RectPx::new(164, 298, 164 + 208, 322));
+        // "Try the movement now" names the button on its right, as on macOS...
+        assert_eq!(preview_label.top, 328);
+        assert_eq!(layout.rect(Part::Preview), RectPx::new(164, 328, 164 + 88, 352));
+        // ...and the note (47 glyphs, one line) goes under the label.
+        assert_eq!(layout.rect(Part::PreviewNote), RectPx::new(28, 356, 484, 372));
         let footer = layout.rect(Part::MovementFooter);
-        assert_eq!((footer.left, footer.top, footer.right), (28, 356, 454));
+        assert_eq!((footer.left, footer.top, footer.right), (28, 378, 484));
         let close = layout.rect(Part::Close);
         assert_eq!((close.right, close.width(), close.height()), (layout.width - 16, 88, 24));
         assert_eq!(layout.height, close.bottom + 14);
@@ -341,6 +346,7 @@ mod tests {
                 Part::Distance,
                 Part::Interval,
                 Part::Preview,
+                Part::PreviewNote,
                 Part::MovementFooter,
                 Part::GeneralHeader,
                 Part::Launch,
@@ -358,12 +364,17 @@ mod tests {
                 assert!(left.right <= right.left && left.top == right.top, "{row:?} at {scale}");
             }
             let control_x = layout.rect(Part::Mode(0)).left;
-            for label in Part::LABELS.into_iter().chain([Part::ModeLabel, Part::Preview]) {
+            for label in Part::LABELS.into_iter().chain([Part::ModeLabel]) {
                 assert!(layout.rect(label).right < control_x, "{label:?} reaches the controls at {scale}");
             }
-            for part in [Part::ModeFooter, Part::Day(0), Part::From, Part::Hint, Part::Distance, Part::PreviewNote] {
+            for part in [Part::ModeFooter, Part::Day(0), Part::From, Part::Hint, Part::Distance, Part::Preview] {
                 assert_eq!(layout.rect(part).left, control_x, "{part:?} at {scale}");
             }
+            // The Preview button shares its label's row; the note is under both.
+            let (label, button, note) =
+                (layout.rect(Part::PreviewLabel), layout.rect(Part::Preview), layout.rect(Part::PreviewNote));
+            assert_eq!((label.top, label.bottom), (button.top, button.bottom), "Preview row at {scale}");
+            assert!(note.top >= label.bottom && note.left == label.left, "Preview note at {scale}");
         }
     }
 

@@ -6,7 +6,12 @@ use melcat_core::{JiggleMode, Schedule, TimeOfDay, Weekday, INTERVAL_CHOICES};
 use windows::Win32::Foundation::SYSTEMTIME;
 use windows::Win32::UI::WindowsAndMessaging::IDOK;
 
-/// Under the Preview button, as on macOS.
+use crate::messages::sentence;
+
+/// Names the Preview button, as on macOS.
+const PREVIEW_LABEL: &str = "Try the movement now";
+
+/// Under the Preview button's label, as on macOS.
 pub(super) const PREVIEW_NOTE: &str = "Keep your hand off the mouse for a few seconds.";
 
 /// Under the movement controls.
@@ -45,6 +50,8 @@ pub(super) enum Part {
     Distance,
     IntervalLabel,
     Interval,
+    /// "Try the movement now", the label of the Preview button.
+    PreviewLabel,
     Preview,
     PreviewNote,
     MovementFooter,
@@ -76,7 +83,7 @@ pub(super) enum Kind {
 impl Part {
     /// Every part, in creation order, which is also the tab order and the
     /// order screen readers walk (a label right before the control it names).
-    pub(super) const ORDER: [Part; 30] = [
+    pub(super) const ORDER: [Part; 31] = [
         Part::ModeLabel,
         Part::Mode(0),
         Part::Mode(1),
@@ -101,6 +108,7 @@ impl Part {
         Part::Distance,
         Part::IntervalLabel,
         Part::Interval,
+        Part::PreviewLabel,
         Part::Preview,
         Part::PreviewNote,
         Part::MovementFooter,
@@ -110,8 +118,14 @@ impl Part {
     ];
 
     /// The labels of the left column.
-    pub(super) const LABELS: [Part; 5] =
-        [Part::DaysLabel, Part::FromLabel, Part::ToLabel, Part::DistanceLabel, Part::IntervalLabel];
+    pub(super) const LABELS: [Part; 6] = [
+        Part::DaysLabel,
+        Part::FromLabel,
+        Part::ToLabel,
+        Part::DistanceLabel,
+        Part::IntervalLabel,
+        Part::PreviewLabel,
+    ];
 
     /// The control ID. Close is `IDOK`, the ID `IsDialogMessageW` sends for
     /// Enter when no other button has the focus.
@@ -136,6 +150,7 @@ impl Part {
             Part::Preview => 135,
             Part::PreviewNote => 136,
             Part::MovementFooter => 137,
+            Part::PreviewLabel => 138,
             Part::GeneralHeader => 140,
             Part::Launch => 141,
             Part::Close => IDOK.0 as u16,
@@ -150,9 +165,12 @@ impl Part {
     pub(super) fn kind(self) -> Kind {
         match self {
             Part::ModeLabel | Part::ScheduleHeader | Part::MovementHeader | Part::GeneralHeader => Kind::Header,
-            Part::DaysLabel | Part::FromLabel | Part::ToLabel | Part::DistanceLabel | Part::IntervalLabel => {
-                Kind::Label
-            }
+            Part::DaysLabel
+            | Part::FromLabel
+            | Part::ToLabel
+            | Part::DistanceLabel
+            | Part::IntervalLabel
+            | Part::PreviewLabel => Kind::Label,
             Part::ModeFooter | Part::Hint | Part::PreviewNote | Part::MovementFooter => Kind::Note,
             Part::Mode(_) => Kind::Radio,
             Part::Day(_) | Part::Launch => Kind::Check,
@@ -178,6 +196,7 @@ impl Part {
             Part::MovementHeader => "Movement",
             Part::DistanceLabel => "Distance",
             Part::IntervalLabel => "Move after idle",
+            Part::PreviewLabel => PREVIEW_LABEL,
             Part::Preview => "Preview",
             Part::PreviewNote => PREVIEW_NOTE,
             Part::MovementFooter => MOVEMENT_FOOTER,
@@ -234,8 +253,10 @@ pub(super) fn schedule_hint(schedule: &Schedule, time: &dyn Fn(TimeOfDay) -> Str
     None
 }
 
+/// One final period, even when the locale's time already ends with one
+/// ("6:00 a.m.", "6:00 π.μ.").
 fn night_hint(end: TimeOfDay, time: &dyn Fn(TimeOfDay) -> String) -> String {
-    format!("Ends the next morning at {}.", time(end))
+    sentence(&format!("Ends the next morning at {}", time(end)))
 }
 
 /// Every kind of hint, with sample times, so the layout keeps room for the
@@ -286,7 +307,7 @@ pub(super) fn from_system_time(time: &SYSTEMTIME) -> TimeOfDay {
 }
 
 /// The pickers' display format: the user's short time format
-/// (`LOCALE_SSHORTTIME`, hours and minutes, "HH:mm" or "h:mm tt"), whose
+/// (`ui::text::short_time_format`, hours and minutes, "HH:mm" or "h:mm tt"), whose
 /// picture codes the picker understands. 24-hour if the locale gives none.
 pub(super) fn picker_format(short_time: &str) -> String {
     let short_time = short_time.trim();
@@ -328,6 +349,11 @@ mod tests {
         assert_eq!(schedule_hint(&night, &clock).as_deref(), Some("Ends the next morning at 06:00."));
         let twelve_hour = |time: TimeOfDay| format!("{}:{:02} AM", time.hour(), time.minute());
         assert_eq!(schedule_hint(&night, &twelve_hour).as_deref(), Some("Ends the next morning at 6:00 AM."));
+        // A marker that ends with a period does not get a second one.
+        let dotted = |time: TimeOfDay| format!("{}:{:02} a.m.", time.hour(), time.minute());
+        assert_eq!(schedule_hint(&night, &dotted).as_deref(), Some("Ends the next morning at 6:00 a.m."));
+        let greek = |time: TimeOfDay| format!("{}:{:02} \u{3c0}.\u{3bc}.", time.hour(), time.minute());
+        assert_eq!(schedule_hint(&night, &greek).as_deref(), Some("Ends the next morning at 6:00 \u{3c0}.\u{3bc}."));
         // No days wins over everything else, as on macOS.
         let empty_night = Schedule::new(Days::EMPTY, TimeOfDay::hm(22, 0), TimeOfDay::hm(6, 0));
         assert_eq!(schedule_hint(&empty_night, &clock).as_deref(), Some("Pick at least one day."));
@@ -339,6 +365,8 @@ mod tests {
         assert!(samples.iter().any(|sample| sample == "Pick at least one day."));
         assert!(samples.iter().any(|sample| sample.starts_with("Start and end are the same")));
         assert!(samples.iter().any(|sample| sample == "Ends the next morning at 22:58."));
+        let dotted = hint_samples(&|time| format!("{time} p.m."));
+        assert!(dotted.iter().all(|sample| !sample.ends_with("..")), "{dotted:?}");
     }
 
     #[test]
@@ -398,6 +426,10 @@ mod tests {
         let modes: Vec<_> = (0..3).map(|index| Part::Mode(index).title()).collect();
         assert_eq!(modes, ["On Schedule", "Always On", "Off"]);
         assert_eq!(Part::IntervalLabel.title(), "Move after idle");
+        assert_eq!(Part::PreviewLabel.title(), "Try the movement now");
+        assert_eq!(Part::PreviewLabel.kind(), Kind::Label);
+        assert_eq!(Part::Preview.title(), "Preview");
+        assert_eq!(Part::PreviewNote.title(), "Keep your hand off the mouse for a few seconds.");
         assert_eq!(Part::Launch.title(), "Launch at login");
         assert!(
             MOVEMENT_FOOTER.contains("without keyboard, mouse or touch input (a little sooner"),
@@ -405,6 +437,16 @@ mod tests {
         );
         assert!(MOVEMENT_FOOTER.ends_with("screen saver and screen-off delays."));
         assert!(!MOVEMENT_FOOTER.contains("  "), "no double spaces from the line breaks");
+    }
+
+    #[test]
+    fn the_preview_label_comes_right_before_the_button_and_its_note() {
+        let at = |part: Part| Part::ORDER.iter().position(|&p| p == part);
+        let label = at(Part::PreviewLabel).unwrap_or_default();
+        assert_eq!(at(Part::Preview), Some(label + 1));
+        assert_eq!(at(Part::PreviewNote), Some(label + 2));
+        assert!(Part::LABELS.contains(&Part::PreviewLabel));
+        assert!(!Part::PreviewLabel.is_tab_stop() && !Part::PreviewLabel.is_schedule());
     }
 
     #[test]

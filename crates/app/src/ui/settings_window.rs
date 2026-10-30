@@ -9,6 +9,9 @@
 //! `NONCLIENTMETRICSW.lfMessageFont`) at the window's DPI. Per-monitor DPI v2:
 //! lay everything out in logical units times `GetDpiForWindow / 96`, and on
 //! `WM_DPICHANGED` recreate the font, re-layout and move to the suggested rect.
+//! After every re-layout (a DPI change, or a new message font or text size)
+//! the window and all its controls are repainted, so no label keeps pixels
+//! drawn in the old font.
 //!
 //! Layout, top to bottom (English labels, as on macOS):
 //!
@@ -18,14 +21,16 @@
 //!                  "Mel keeps your computer active at any time." / "Mel leaves the pointer alone.">
 //! Schedule
 //!   Days          [Sun] [Mon] [Tue] [Wed] [Thu] [Fri] [Sat]   check boxes, ordered from ui::text::first_weekday()
-//!   From          [09:00 ▴▾]       DateTimePicker, DTS_TIMEFORMAT | DTS_UPDOWN
+//!   From          [09:00 ▴▾]       DateTimePicker, DTS_TIMEFORMAT | DTS_UPDOWN, ui::text::short_time_format
 //!   To            [18:00 ▴▾]
 //!   <hint>        "Pick at least one day." / "Start and end are the same: all day on the selected days." /
-//!                 "Ends the next morning at 06:00." (ui::text::locale_time_of_day) / nothing
+//!                 "Ends the next morning at 06:00." (ui::text::locale_time_of_day, the pickers' format;
+//!                 one final period even after "6:00 a.m.") / nothing
 //! Movement
 //!   Distance      [Gentle · up to 5 pt ▾]    combo box (CBS_DROPDOWNLIST), ui::text::intensity_title
 //!   Move after idle [1 minute ▾]             combo box: INTERVAL_CHOICES plus the current value if custom
-//!   [Preview]     "Keep your hand off the mouse for a few seconds."
+//!   Try the movement now [Preview]
+//!   "Keep your hand off the mouse for a few seconds."      (under the label, as on macOS)
 //!   <footer: "Mel moves the pointer after about this long without keyboard, mouse or touch input
 //!            (a little sooner, at random), then again each time it passes, and lets go when you use
 //!            the mouse or keyboard. Pick a time shorter than your screen saver and screen-off delays.">
@@ -78,12 +83,11 @@ use std::rc::{Rc, Weak};
 use melcat_core::{describe_interval, Intensity, JiggleMode, TimeOfDay, Weekday};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM};
-use windows::Win32::Globalization::{GetLocaleInfoEx, LOCALE_SSHORTTIME};
 use windows::Win32::Graphics::Gdi::{
     CreateFontIndirectW, DeleteObject, DrawTextW, GetDC, GetMonitorInfoW, GetSysColor, GetSysColorBrush,
-    InvalidateRect, MonitorFromPoint, ReleaseDC, SelectObject, SetBkColor, SetTextColor, COLOR_GRAYTEXT, COLOR_WINDOW,
-    COLOR_WINDOWTEXT, DT_CALCRECT, DT_NOPREFIX, DT_SINGLELINE, DT_WORDBREAK, FW_SEMIBOLD, HBRUSH, HDC, HFONT, LOGFONTW,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    InvalidateRect, MonitorFromPoint, RedrawWindow, ReleaseDC, SelectObject, SetBkColor, SetTextColor, COLOR_GRAYTEXT,
+    COLOR_WINDOW, COLOR_WINDOWTEXT, DT_CALCRECT, DT_NOPREFIX, DT_SINGLELINE, DT_WORDBREAK, FW_SEMIBOLD, HBRUSH, HDC,
+    HFONT, LOGFONTW, MONITORINFO, MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
 };
 use windows::Win32::System::SystemServices::{SS_CENTERIMAGE, SS_LEFT, SS_NOPREFIX};
 use windows::Win32::UI::Controls::{
@@ -110,7 +114,7 @@ use crate::geom::RectPx;
 use crate::messages::{WM_APP_PREVIEW, WM_APP_SETTINGS_CHANGED, WM_APP_SETTINGS_CLOSED};
 use crate::settings::Settings;
 use crate::ui::{autostart, text, window};
-use crate::util::{from_wide, wide};
+use crate::util::wide;
 
 const CLASS: PCWSTR = w!("MelCat.Settings");
 const TITLE: PCWSTR = w!("MelCat Settings");
@@ -164,7 +168,7 @@ impl SettingsWindow {
             )
         }?;
         let days = page::day_order(text::first_weekday());
-        let time_format = wide(&page::picker_format(&short_time_format()));
+        let time_format = wide(&page::picker_format(&text::short_time_format()));
         let controls = match create_controls(hwnd, &days, &time_format) {
             Ok(controls) => controls,
             Err(error) => {
@@ -831,8 +835,8 @@ fn create_control(parent: HWND, part: Part, title: &str) -> windows::core::Resul
     }
 }
 
-/// Recreates the fonts at `dpi`, lays the page out and places the controls.
-/// Returns the window size that fits the page.
+/// Recreates the fonts at `dpi`, lays the page out, places the controls and
+/// repaints them all. Returns the window size that fits the page.
 fn relayout(state: &Rc<RefCell<State>>, dpi: u32) -> Option<(i32, i32)> {
     let (hwnd, controls, texts) = {
         let st = state.try_borrow().ok()?;
@@ -863,9 +867,12 @@ fn relayout(state: &Rc<RefCell<State>>, dpi: u32) -> Option<(i32, i32)> {
             std::mem::forget(fonts);
         }
     }
-    // SAFETY: repaints our own window.
+    // The controls got their new fonts without redrawing, and a moved static
+    // control keeps its old pixels; the parent clips its children, so
+    // invalidating it alone would not reach them. Repaint all of it.
+    // SAFETY: repaints our own window and its controls.
     unsafe {
-        let _ = InvalidateRect(Some(hwnd), None, true);
+        let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
     }
     Some(window_size(layout.width, layout.height, dpi))
 }
@@ -987,18 +994,6 @@ fn work_area_under_pointer() -> RectPx {
         } else {
             RectPx::new(0, 0, 1024, 768)
         }
-    }
-}
-
-/// The user's short time format (`LOCALE_SSHORTTIME`), empty if it cannot be read.
-fn short_time_format() -> String {
-    let mut buffer = [0u16; 80];
-    // SAFETY: the buffer goes with its length; a null name means the user's locale.
-    let length = unsafe { GetLocaleInfoEx(PCWSTR::null(), LOCALE_SSHORTTIME, Some(&mut buffer)) };
-    if length > 0 {
-        from_wide(&buffer)
-    } else {
-        String::new()
     }
 }
 

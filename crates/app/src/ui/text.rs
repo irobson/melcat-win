@@ -25,7 +25,12 @@
 //! [`intensity_title`]: `Gentle · up to 5 pt` (title, middle dot, radius).
 //!
 //! The locale functions read the user's own formats (`LOCALE_NAME_USER_DEFAULT`,
-//! so the Region settings' overrides count). Instants are turned into a wall
+//! so the Region settings' overrides count). Times use the short time format
+//! (`LOCALE_SSHORTTIME`, [`short_time_format`], the format the settings
+//! window's pickers show), passed to `GetTimeFormatEx` without seconds; it is
+//! read on every call, so a change in the Region settings applies at once.
+//! Only when it cannot be read is the format left to Windows (a null format).
+//! Instants are turned into a wall
 //! clock with `ChronoCalendar<chrono::Local>`, the same calendar the jiggler
 //! uses for the schedule, so "18:00" in the status line is the 18:00 the
 //! schedule meant. If Windows cannot format a value, a 24-hour `HH:MM` (and
@@ -35,11 +40,12 @@ use melcat_core::{Calendar, ChronoCalendar, Instant, Intensity, LocalDate, Relat
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::SYSTEMTIME;
 use windows::Win32::Globalization::{
-    GetDateFormatEx, GetLocaleInfoEx, GetTimeFormatEx, DATE_SHORTDATE, LOCALE_IFIRSTDAYOFWEEK, TIME_NOSECONDS,
+    GetDateFormatEx, GetLocaleInfoEx, GetTimeFormatEx, DATE_SHORTDATE, LOCALE_IFIRSTDAYOFWEEK, LOCALE_SSHORTTIME,
+    TIME_NOSECONDS,
 };
 
 use crate::jiggle::Status;
-use crate::util::wide::from_wide;
+use crate::util::wide::{from_wide, wide};
 
 /// U+2026, used when a Win32 buffer is too small for the text.
 pub(crate) const ELLIPSIS: char = '\u{2026}';
@@ -163,22 +169,44 @@ fn system_time(date: LocalDate, time: TimeOfDay) -> SYSTEMTIME {
     }
 }
 
+/// The user's short time format (`LOCALE_SSHORTTIME`: "HH:mm", "h:mm tt"),
+/// empty if it cannot be read. The tray texts and the settings window's time
+/// pickers both use it, so they always show times the same way.
+pub(crate) fn short_time_format() -> String {
+    read_wide(|buffer| {
+        // SAFETY: the buffer, if any, is a live slice whose length windows-rs
+        // passes as the character count; `None` asks for the length.
+        unsafe { GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_SSHORTTIME, buffer) }
+    })
+    .unwrap_or_default()
+}
+
 /// The time of `system` in the user's short format, without seconds.
 fn format_time(system: &SYSTEMTIME) -> Option<String> {
+    format_time_as(&short_time_format(), system)
+}
+
+/// The time of `system` in the picture `format` (a `LOCALE_SSHORTTIME`
+/// value), without seconds.
+fn format_time_as(format: &str, system: &SYSTEMTIME) -> Option<String> {
+    let picture = time_picture(format);
+    let format = picture.as_ref().map_or(PCWSTR::null(), |picture| PCWSTR(picture.as_ptr()));
     read_wide(|buffer| {
-        // SAFETY: `system` outlives the call and is only read; the buffer, if
-        // any, is a live slice whose length windows-rs passes along; null
-        // format and locale pointers mean "the user's default".
+        // SAFETY: `system` and the null-terminated `picture` outlive the call
+        // and are only read; the buffer, if any, is a live slice whose length
+        // windows-rs passes along; a null locale means the user's default, a
+        // null format the locale's own.
         unsafe {
-            GetTimeFormatEx(
-                LOCALE_NAME_USER_DEFAULT,
-                TIME_NOSECONDS,
-                Some(system as *const SYSTEMTIME),
-                PCWSTR::null(),
-                buffer,
-            )
+            GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, Some(system as *const SYSTEMTIME), format, buffer)
         }
     })
+}
+
+/// The picture `GetTimeFormatEx` gets for the short time format `format`:
+/// the format itself, or `None` (a null format: Windows picks the locale's
+/// own) when it is blank.
+fn time_picture(format: &str) -> Option<Vec<u16>> {
+    (!format.trim().is_empty()).then(|| wide(format))
 }
 
 /// The date of `system` in the user's short format.
@@ -445,6 +473,30 @@ mod tests {
     }
 
     #[test]
+    fn the_short_time_format_is_the_picture_unless_blank() {
+        assert_eq!(time_picture("HH:mm"), Some(wide("HH:mm")));
+        assert_eq!(time_picture("h:mm tt"), Some(wide("h:mm tt")));
+        assert_eq!(time_picture(""), None);
+        assert_eq!(time_picture("  "), None);
+    }
+
+    /// Times follow the short format they are given, not the locale's long
+    /// one, and never show seconds.
+    #[test]
+    fn times_are_formatted_with_the_given_picture() {
+        let evening = system_time(MONDAY, TimeOfDay::hm(18, 5));
+        assert_eq!(format_time_as("HH:mm", &evening).as_deref(), Some("18:05"));
+        assert_eq!(format_time_as("H.mm", &evening).as_deref(), Some("18.05"));
+        assert_eq!(format_time_as("HH:mm:ss", &evening).as_deref(), Some("18:05"));
+        let morning = system_time(MONDAY, TimeOfDay::hm(6, 0));
+        assert_eq!(format_time_as("HH:mm", &morning).as_deref(), Some("06:00"));
+        assert_eq!(format_time_as("H:mm", &morning).as_deref(), Some("6:00"));
+        // Blank: the locale's own time format still gives a time.
+        let fallback = format_time_as("", &evening).unwrap_or_default();
+        assert!(fallback.contains("05"), "{fallback:?}");
+    }
+
+    #[test]
     fn iso_dates_are_zero_padded() {
         assert_eq!(iso_date(LocalDate::new(2026, 3, 7)), "2026-03-07");
     }
@@ -458,6 +510,7 @@ mod tests {
             assert!(!text.trim().is_empty(), "{text:?}");
             assert!(!text.contains('\0'), "{text:?}");
         }
+        assert!(!short_time_format().contains('\0'));
         let _ = first_weekday();
     }
 
