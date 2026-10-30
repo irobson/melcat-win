@@ -1,0 +1,12 @@
+[package]
+name = "melcat-core"
+description = "Platform-independent logic for MelCat: the schedule, the decision to move and the stroll planner."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+chrono-tz = "0.10"

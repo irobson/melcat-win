@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main, 'ci/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Any compiler, lint or linker warning (linker output is the
+  # `linker_messages` lint) fails the build: CI stays warning-free.
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Test and build (Windows, MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build release
+        run: cargo build --release -p melcat
+
+      - name: Upload MelCat.exe
+        uses: actions/upload-artifact@v6
+        with:
+          name: MelCat-${{ github.sha }}
+          path: target/release/MelCat.exe
+          retention-days: 30
+          if-no-files-found: error
+
+  smoke:
+    name: Smoke test (MelCat.exe on the runner desktop)
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out
+        uses: actions/checkout@v6
+
+      - name: Download MelCat.exe
+        uses: actions/download-artifact@v7
+        with:
+          name: MelCat-${{ github.sha }}
+          path: dist
+
+      - name: Smoke test
+        shell: powershell
+        run: .\scripts\smoke-test.ps1 -Exe dist\MelCat.exe -ArtifactsDir smoke-artifacts
+
+      - name: Upload smoke artifacts (log, desktop screenshots, summary)
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: smoke-${{ github.sha }}
+          path: smoke-artifacts
+          retention-days: 14
+          if-no-files-found: warn
