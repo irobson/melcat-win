@@ -107,6 +107,6 @@ jobs:
 
           Windows SmartScreen may warn that the app is unrecognized, because it is not code-signed yet: click **More info**, then **Run anyway**. The `.zip` holds the same exe with the README and the license, and `SHA256SUMS.txt` lists the checksums.
 
-          Requires Windows 10 version 1607 or later, or Windows 11, x64 (runs on ARM64 Windows through emulation).
+          Requires Windows 10 version 1607 or later, or Windows 11, x64. ARM64 PCs with Windows 11 run it through x64 emulation; Windows 10 on ARM cannot run it.
           "@
           gh release create $tag dist/* --title "MelCat $tag" --notes $notes --generate-notes --verify-tag
