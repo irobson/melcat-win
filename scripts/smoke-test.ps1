@@ -53,12 +53,16 @@
                     (control 135), on its row, with the note (control 136)
                     under the label.
       settings-repaint
-                    After WM_DPICHANGED for 144 DPI (no suggested rectangle,
-                    so the window keeps its corner; it must grow about 1.5
-                    times), every label of the settings window on the screen
-                    shows exactly the pixels a full repaint (RedrawWindow with
-                    RDW_ALLCHILDREN | RDW_UPDATENOW) gives: none keeps pixels
-                    drawn in the old font. The window is made topmost first.
+                    After a larger text size (the message font 1.5 times as
+                    tall, set for the session only with SPI_SETNONCLIENTMETRICS
+                    and put back afterwards, then the WM_SETTINGCHANGE Windows
+                    sends for it; the window must grow), every label of the
+                    settings window on the screen shows exactly the pixels a
+                    full repaint (RedrawWindow with RDW_ALLCHILDREN |
+                    RDW_UPDATENOW) gives: none keeps pixels drawn in the old
+                    font. The window is made topmost first. (WM_DPICHANGED
+                    takes the same path, but Windows refuses to send it from
+                    another process.)
       settings-short-time
                     With the long time format 'h:mm:ss tt', the short one
                     'HH:mm tt' and the markers 'a.m.'/'p.m.' (SetLocaleInfoW,
@@ -67,6 +71,8 @@
                     schedule end at 06:00 (settings.json end_minutes 360), and
                     the hint reads exactly 'Ends the next morning at 06:00
                     a.m.': the pickers' short format, one final period.
+                    (On this Windows a null format with TIME_NOSECONDS already
+                    gives the short format; the time part guards it.)
 
     Each settings-* step starts MelCat without settings.json (a first launch,
     so the settings window opens), with the pointer parked away from it.
@@ -1709,11 +1715,78 @@ namespace MelCatSmoke.UiSettings
             return "";
         }
 
-        /// Sends WM_DPICHANGED for `dpi` with no suggested rectangle (MelCat then keeps its corner).
-        public static bool SendDpiChanged(IntPtr hwnd, int dpi)
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct LOGFONT
+        {
+            public int lfHeight; public int lfWidth; public int lfEscapement; public int lfOrientation; public int lfWeight;
+            public byte lfItalic; public byte lfUnderline; public byte lfStrikeOut; public byte lfCharSet;
+            public byte lfOutPrecision; public byte lfClipPrecision; public byte lfQuality; public byte lfPitchAndFamily;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string lfFaceName;
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        public struct NONCLIENTMETRICS
+        {
+            public int cbSize; public int iBorderWidth; public int iScrollWidth; public int iScrollHeight; public int iCaptionWidth; public int iCaptionHeight;
+            public LOGFONT lfCaptionFont; public int iSmCaptionWidth; public int iSmCaptionHeight; public LOGFONT lfSmCaptionFont;
+            public int iMenuWidth; public int iMenuHeight; public LOGFONT lfMenuFont; public LOGFONT lfStatusFont; public LOGFONT lfMessageFont;
+            public int iPaddedBorderWidth;
+        }
+        [DllImport("user32.dll", EntryPoint = "SystemParametersInfoW", CharSet = CharSet.Unicode, SetLastError = true)]
+        static extern bool SystemParametersInfoMetrics(uint action, uint param, ref NONCLIENTMETRICS metrics, uint winIni);
+
+        static NONCLIENTMETRICS savedMetrics;
+        static bool haveSaved;
+
+        static string Metrics(out NONCLIENTMETRICS metrics)
+        {
+            metrics = new NONCLIENTMETRICS();
+            metrics.cbSize = Marshal.SizeOf(typeof(NONCLIENTMETRICS));
+            if (SystemParametersInfoMetrics(0x0029 /* SPI_GETNONCLIENTMETRICS */, (uint)metrics.cbSize, ref metrics, 0)) return "";
+            return "SPI_GETNONCLIENTMETRICS error " + Marshal.GetLastWin32Error();
+        }
+
+        static string SetMetrics(NONCLIENTMETRICS metrics)
+        {
+            // Not saved to the profile and not broadcast: only this session's value changes.
+            if (SystemParametersInfoMetrics(0x002A /* SPI_SETNONCLIENTMETRICS */, (uint)metrics.cbSize, ref metrics, 0)) return "";
+            return "SPI_SETNONCLIENTMETRICS error " + Marshal.GetLastWin32Error();
+        }
+
+        /// The message font: "face height".
+        public static string MessageFont()
+        {
+            NONCLIENTMETRICS m;
+            string err = Metrics(out m);
+            return err != "" ? err : m.lfMessageFont.lfFaceName + " " + m.lfMessageFont.lfHeight;
+        }
+
+        /// Makes the message font `factor` times as tall (the first call saves the original); "" or the error.
+        public static string ScaleMessageFont(double factor)
+        {
+            NONCLIENTMETRICS m;
+            string err = Metrics(out m);
+            if (err != "") return err;
+            if (!haveSaved) { savedMetrics = m; haveSaved = true; }
+            m.lfMessageFont.lfHeight = (int)Math.Round(m.lfMessageFont.lfHeight * factor);
+            return SetMetrics(m);
+        }
+
+        /// Puts back the message font ScaleMessageFont saved; "" or the error.
+        public static string RestoreMessageFont()
+        {
+            if (!haveSaved) return "";
+            string err = SetMetrics(savedMetrics);
+            if (err == "") haveSaved = false;
+            return err;
+        }
+
+        /// Sends WM_SETTINGCHANGE for SPI_SETNONCLIENTMETRICS, as Windows does
+        /// when the text size changes; "" or the error.
+        public static string SendMetricsChanged(IntPtr hwnd)
         {
             IntPtr result;
-            return SendPlain(hwnd, 0x02E0, (IntPtr)((dpi << 16) | dpi), IntPtr.Zero, SMTO_ABORTIFHUNG, 5000, out result) != IntPtr.Zero;
+            if (SendPlain(hwnd, 0x001A, (IntPtr)0x002A, IntPtr.Zero, SMTO_ABORTIFHUNG, 5000, out result) != IntPtr.Zero) return "";
+            return "SendMessageTimeout error " + Marshal.GetLastWin32Error();
         }
 
         /// Repaints the window and every control in it, now.
@@ -1870,42 +1943,53 @@ namespace MelCatSmoke.UiSettings
 
     Invoke-Step 'settings-repaint' {
         $hwnd = Open-SettingsWindow
-        Assert ([MelCatSmoke.UiSettings.Win]::Raise($hwnd)) 'could not put the settings window on top'
-        Start-Sleep -Milliseconds 300
-        $before = [MelCatSmoke.UiSettings.Win]::Rect($hwnd)
-        # A DPI change to 150 % as Windows sends it, minus the suggested rectangle.
-        Assert ([MelCatSmoke.UiSettings.Win]::SendDpiChanged($hwnd, 144)) 'WM_DPICHANGED was not answered within 5 s'
-        Start-Sleep -Milliseconds 700
-        $after = [MelCatSmoke.UiSettings.Win]::Rect($hwnd)
-        $grew = ($after[2] - $after[0]) / [double]($before[2] - $before[0])
-        Note ('WM_DPICHANGED 144: the window went from {0} to {1} ({2:N2} times as wide)' -f ($before -join ','), ($after -join ','), $grew)
-        Assert (($grew -gt 1.3) -and ($grew -lt 1.7)) 'the window was not laid out again at 144 DPI'
+        try {
+            Assert ([MelCatSmoke.UiSettings.Win]::Raise($hwnd)) 'could not put the settings window on top'
+            Start-Sleep -Milliseconds 300
+            $before = [MelCatSmoke.UiSettings.Win]::Rect($hwnd)
+            # A larger text size: the message font half as tall again, and the
+            # WM_SETTINGCHANGE Windows sends for it.
+            $font = [MelCatSmoke.UiSettings.Win]::MessageFont()
+            $err = [MelCatSmoke.UiSettings.Win]::ScaleMessageFont(1.5)
+            Assert ($err -eq '') $err
+            Note "message font: $font, now $([MelCatSmoke.UiSettings.Win]::MessageFont())"
+            $err = [MelCatSmoke.UiSettings.Win]::SendMetricsChanged($hwnd)
+            Assert ($err -eq '') "WM_SETTINGCHANGE (SPI_SETNONCLIENTMETRICS) was not answered: $err"
+            Start-Sleep -Milliseconds 700
+            $after = [MelCatSmoke.UiSettings.Win]::Rect($hwnd)
+            $grew = ($after[2] - $after[0]) / [double]($before[2] - $before[0])
+            Note ('the window went from {0} to {1} ({2:N2} times as wide)' -f ($before -join ','), ($after -join ','), $grew)
+            Assert ($grew -gt 1.1) 'the window was not laid out again for the larger font'
 
-        # The part of the window on the screen, and the labels in it.
-        $p = $script:Primary
-        $area = [int[]]@([Math]::Max($after[0], $p.Left), [Math]::Max($after[1], $p.Top), [Math]::Min($after[2], $p.Right), [Math]::Min($after[3], $p.Bottom))
-        $statics = @([MelCatSmoke.UiSettings.Win]::Children($hwnd) | Where-Object { $_.Class -eq 'Static' -and $_.Visible -and $_.Text -ne '' })
-        $covered = @($statics | Where-Object {
-            $x = [int][Math]::Floor(($_.Left + $_.Right) / 2); $y = [int][Math]::Floor(($_.Top + $_.Bottom) / 2)
-            ($x -ge $area[0]) -and ($x -lt $area[2]) -and ($y -ge $area[1]) -and ($y -lt $area[3]) -and ([MelCatSmoke.UiSettings.Win]::OwnerAt($x, $y) -ne $script:Mel.Id)
-        })
-        Assert ($covered.Count -eq 0) "another window covers labels of the settings window: $($covered -join '; ')"
+            # The part of the window on the screen, and the labels in it.
+            $p = $script:Primary
+            $area = [int[]]@([Math]::Max($after[0], $p.Left), [Math]::Max($after[1], $p.Top), [Math]::Min($after[2], $p.Right), [Math]::Min($after[3], $p.Bottom))
+            $statics = @([MelCatSmoke.UiSettings.Win]::Children($hwnd) | Where-Object { $_.Class -eq 'Static' -and $_.Visible -and $_.Text -ne '' })
+            $covered = @($statics | Where-Object {
+                $x = [int][Math]::Floor(($_.Left + $_.Right) / 2); $y = [int][Math]::Floor(($_.Top + $_.Bottom) / 2)
+                ($x -ge $area[0]) -and ($x -lt $area[2]) -and ($y -ge $area[1]) -and ($y -lt $area[3]) -and ([MelCatSmoke.UiSettings.Win]::OwnerAt($x, $y) -ne $script:Mel.Id)
+            })
+            Assert ($covered.Count -eq 0) "another window covers labels of the settings window: $($covered -join '; ')"
 
-        # What the window shows now, against what it shows once every control repainted.
-        $shown = [MelCatSmoke.UiSettings.Win]::Capture($area)
-        Assert ([MelCatSmoke.UiSettings.Win]::RepaintAll($hwnd)) 'RedrawWindow failed'
-        Start-Sleep -Milliseconds 500
-        $repainted = [MelCatSmoke.UiSettings.Win]::Capture($area)
-        $shown.Save((Join-Path $ArtifactsDir 'settings-repaint-1-after-dpi-change.png'), [System.Drawing.Imaging.ImageFormat]::Png)
-        $repainted.Save((Join-Path $ArtifactsDir 'settings-repaint-2-repainted.png'), [System.Drawing.Imaging.ImageFormat]::Png)
-        [MelCatSmoke.UiSettings.Win]::Compare($shown, $repainted, $area, $statics)
-        $compared = [MelCatSmoke.UiSettings.Win]::Compared
-        $differ = [MelCatSmoke.UiSettings.Win]::DifferentPixels
-        Note ('{0} labels on screen compared (screenshots settings-repaint-*.png): {1} pixels differ after a full repaint{2}' -f $compared, $differ, $(if ($differ -gt 0) { ': ' + [MelCatSmoke.UiSettings.Win]::Detail } else { '' }))
-        $shown.Dispose(); $repainted.Dispose()
-        Assert ($compared -ge 5) "only $compared labels of the settings window are on the screen"
-        Assert ($differ -eq 0) "labels still showed pixels drawn before the DPI change: $([MelCatSmoke.UiSettings.Win]::Detail)"
-        Close-SettingsWindow $hwnd
+            # What the window shows now, against what it shows once every control repainted.
+            $shown = [MelCatSmoke.UiSettings.Win]::Capture($area)
+            Assert ([MelCatSmoke.UiSettings.Win]::RepaintAll($hwnd)) 'RedrawWindow failed'
+            Start-Sleep -Milliseconds 500
+            $repainted = [MelCatSmoke.UiSettings.Win]::Capture($area)
+            $shown.Save((Join-Path $ArtifactsDir 'settings-repaint-1-after-font-change.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+            $repainted.Save((Join-Path $ArtifactsDir 'settings-repaint-2-repainted.png'), [System.Drawing.Imaging.ImageFormat]::Png)
+            [MelCatSmoke.UiSettings.Win]::Compare($shown, $repainted, $area, $statics)
+            $compared = [MelCatSmoke.UiSettings.Win]::Compared
+            $differ = [MelCatSmoke.UiSettings.Win]::DifferentPixels
+            Note ('{0} labels on screen compared (screenshots settings-repaint-*.png): {1} pixels differ after a full repaint{2}' -f $compared, $differ, $(if ($differ -gt 0) { ': ' + [MelCatSmoke.UiSettings.Win]::Detail } else { '' }))
+            $shown.Dispose(); $repainted.Dispose()
+            Assert ($compared -ge 5) "only $compared labels of the settings window are on the screen"
+            Assert ($differ -eq 0) "labels still showed pixels drawn in the old font: $([MelCatSmoke.UiSettings.Win]::Detail)"
+            Close-SettingsWindow $hwnd
+        } finally {
+            $err = [MelCatSmoke.UiSettings.Win]::RestoreMessageFont()
+            if ($err) { Write-Host "    (could not restore the message font: $err)" }
+        }
     }
 
     Invoke-Step 'settings-short-time' {
@@ -1949,7 +2033,7 @@ namespace MelCatSmoke.UiSettings
             Assert $ended 'the schedule did not end at 06:00 after twelve Down presses on the To picker'
             Assert (-not $text.EndsWith('..')) "the hint ends in two periods: '$text'"
             $expected = 'Ends the next morning at 06:00 a.m.'
-            Assert ($text -eq $expected) "the hint reads '$text', not '$expected' (the short time format HH:mm tt, as the pickers show it; the long one gives 6:00 a.m.)"
+            Assert ($text -eq $expected) "the hint reads '$text', not '$expected' (the short time format HH:mm tt, as the pickers show it)"
             Close-SettingsWindow $hwnd
         } finally {
             Close-MelCat
