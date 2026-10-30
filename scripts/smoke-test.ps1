@@ -1346,7 +1346,8 @@ namespace MelCatSmoke.Kill
         # One click on the test button counts once.
         $cx = [int][Math]::Floor(($button[0] + $button[2]) / 2)
         $cy = [int][Math]::Floor(($button[1] + $button[3]) / 2)
-        if (-not [MelCatSmoke.Kill.Ui]::ButtonAt($cx, $cy)) {
+        # The runner's terminal can sit above even a topmost window shown later.
+        for ($try = 1; ($try -le 3) -and (-not [MelCatSmoke.Kill.Ui]::ButtonAt($cx, $cy)); $try++) {
             Note "the test button is covered: $([MelCatSmoke.Kill.Ui]::Describe($cx, $cy)); raising it"
             [MelCatSmoke.Kill.Ui]::Raise()
             Start-Sleep -Milliseconds 300
